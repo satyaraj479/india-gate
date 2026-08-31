@@ -1,0 +1,2462 @@
+openapi: 3.1.0
+
+info:
+  title: India Gate Platform API
+  version: 1.0.0
+  summary: Ordering, catering, reservations and Gate Points for India Gate.
+  description: |
+    One REST contract serving three clients: the Next.js web app, the Expo
+    mobile app, and the outlet-facing ops console. Generated TypeScript types
+    from this document are the *only* API types that exist in the monorepo —
+    no client hand-writes a response interface.
+
+    ## Conventions
+
+    **Money.** Every amount is an integer in the currency's minor unit and is
+    suffixed `Cents`. There are no floats anywhere in this API.
+
+    **Time.** All timestamps are RFC 3339 with an offset. Anything a human
+    picks on a calendar (`eventDate`, `serviceDate`) is a bare `date`
+    interpreted in the *outlet's* timezone, which is on every outlet object.
+    Clients must not localise those with the device clock.
+
+    **Idempotency.** Every `POST` that creates money or capacity requires an
+    `Idempotency-Key` header. The server stores the first response for 24
+    hours and replays it verbatim on retry. This is not optional: mobile
+    clients retry on flaky networks and a double-tapped "Place Order" must not
+    produce two orders.
+
+    **Concurrency.** Mutations on orders, reservations and catering bookings
+    take an `If-Match` header carrying the resource's `version`. A mismatch
+    returns `409` with the current representation so the client can rebase.
+
+    **Errors.** RFC 9457 problem documents. `type` is a stable slug the client
+    switches on; `detail` is human-readable and may change.
+
+    **Pagination.** Cursor-based. `?limit=&cursor=`; responses carry
+    `pageInfo.nextCursor`. Offsets are never used — order lists mutate under
+    the reader.
+
+    ## What is deliberately not REST
+
+    Real-time order tracking and kitchen-display updates are **not** polled.
+    They arrive over the WebSocket gateway documented under
+    `x-realtime-channels` at the bottom of this document. The REST endpoints
+    exist as the reconnect/backfill path.
+
+  contact:
+    name: India Gate Engineering
+  license:
+    name: Proprietary
+
+servers:
+  - url: https://api.indiagate.sg/v1
+    description: Production
+  - url: https://staging-api.indiagate.sg/v1
+    description: Staging
+  - url: http://localhost:4000/v1
+    description: Local
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Auth
+    description: Phone-OTP first, social and password secondary.
+  - name: Outlets
+    description: Locations, hours, delivery zones, serviceability.
+  - name: Menu
+    description: Channel-scoped catalog with variants and modifiers.
+  - name: Cart
+    description: Server-authoritative cart. The client never computes a total.
+  - name: Orders
+    description: Checkout, order lifecycle, tracking backfill.
+  - name: Catering
+    description: Package browsing, the course wizard, quotes and bookings.
+  - name: Reservations
+    description: Availability, holds and confirmation.
+  - name: Loyalty
+    description: Gate Points balances, ledger, rewards.
+  - name: Coupons
+  - name: Account
+  - name: Webhooks
+    description: Inbound callbacks from payment and delivery providers.
+
+# ============================================================================
+#  PATHS
+# ============================================================================
+paths:
+
+  # -- Auth ------------------------------------------------------------------
+  /auth/otp/request:
+    post:
+      tags: [Auth]
+      summary: Send a login OTP
+      security: []
+      description: |
+        Rate limited to 3 per phone per 10 minutes and 20 per IP per hour.
+        Always returns 202 regardless of whether the number exists — the
+        response must not reveal account existence.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone]
+              properties:
+                phone:
+                  type: string
+                  description: E.164.
+                  examples: ["+6591234567"]
+                purpose:
+                  type: string
+                  enum: [LOGIN, SIGNUP, PHONE_CHANGE]
+                  default: LOGIN
+      responses:
+        "202":
+          description: Accepted; an OTP was dispatched if the number is valid.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  challengeId: { type: string, format: uuid }
+                  expiresAt: { type: string, format: date-time }
+                  resendAvailableAt: { type: string, format: date-time }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+
+  /auth/otp/verify:
+    post:
+      tags: [Auth]
+      summary: Exchange an OTP for a token pair
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [challengeId, code]
+              properties:
+                challengeId: { type: string, format: uuid }
+                code: { type: string, minLength: 4, maxLength: 8 }
+                device: { $ref: "#/components/schemas/DeviceRegistration" }
+      responses:
+        "200":
+          description: Authenticated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthSession" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Rotate the refresh token
+      security: []
+      description: |
+        Refresh tokens are single-use and rotate within a family. Presenting a
+        token that has already been rotated revokes the entire family and
+        returns 401 — that is the replay-detection path, not a bug.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthSession" }
+          description: New token pair.
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke the current session
+      responses:
+        "204": { description: Revoked. }
+
+  # -- Outlets ---------------------------------------------------------------
+  /outlets:
+    get:
+      tags: [Outlets]
+      summary: List outlets
+      security: []
+      parameters:
+        - name: channel
+          in: query
+          schema: { $ref: "#/components/schemas/FulfilmentChannel" }
+        - name: lat
+          in: query
+          schema: { type: number, format: double }
+        - name: lng
+          in: query
+          schema: { type: number, format: double }
+      responses:
+        "200":
+          description: Outlets, nearest first when coordinates are supplied.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/Outlet" }
+
+  /outlets/{outletId}:
+    parameters:
+      - $ref: "#/components/parameters/OutletId"
+    get:
+      tags: [Outlets]
+      summary: Outlet detail with opening hours and closures
+      security: []
+      responses:
+        "200":
+          description: Outlet.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OutletDetail" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /outlets/{outletId}/serviceability:
+    parameters:
+      - $ref: "#/components/parameters/OutletId"
+    post:
+      tags: [Outlets]
+      summary: Can this outlet deliver here, and for how much
+      security: []
+      description: |
+        Called before checkout so the guest sees the fee and minimum before
+        building a cart. Resolves the delivery zone by postal prefix first,
+        then by road distance.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [postalCode]
+              properties:
+                postalCode: { type: string }
+                latitude: { type: number, format: double }
+                longitude: { type: number, format: double }
+      responses:
+        "200":
+          description: Serviceability decision.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deliverable]
+                properties:
+                  deliverable: { type: boolean }
+                  reason:
+                    type: string
+                    enum: [OUT_OF_RANGE, OUTLET_CLOSED, CHANNEL_DISABLED]
+                  zoneId: { type: string, format: uuid }
+                  deliveryFeeCents: { type: integer }
+                  minOrderCents: { type: integer }
+                  freeDeliveryAboveCents: { type: integer, nullable: true }
+                  etaMinutes: { type: integer }
+
+  /outlets/{outletId}/fulfilment-slots:
+    parameters:
+      - $ref: "#/components/parameters/OutletId"
+    get:
+      tags: [Outlets]
+      summary: Available delivery / pickup time slots
+      description: |
+        Slot capacity is measured in orders per bucket, not covers. A slot with
+        `remainingOrders: 0` is shown greyed rather than hidden, so the guest
+        understands the kitchen is full rather than thinking the app is broken.
+      parameters:
+        - name: channel
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [DELIVERY, PICKUP]
+        - name: date
+          in: query
+          required: true
+          schema: { type: string, format: date }
+          description: Calendar date in the outlet's timezone.
+      responses:
+        "200":
+          description: Slots for the day.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  timezone: { type: string, examples: ["Asia/Singapore"] }
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/FulfilmentSlot" }
+
+  # -- Menu ------------------------------------------------------------------
+  /outlets/{outletId}/menu:
+    parameters:
+      - $ref: "#/components/parameters/OutletId"
+    get:
+      tags: [Menu]
+      summary: The full channel menu in one payload
+      security: []
+      description: |
+        Deliberately one request, not a category list plus N product calls.
+        The whole menu is ~200KB gzipped and is the single most cached
+        response in the system: `Cache-Control: public, max-age=60,
+        stale-while-revalidate=600` at the CDN, with a strong ETag derived
+        from the catalog version and the outlet's 86 state. Mobile persists
+        it for offline browsing and revalidates with `If-None-Match`.
+      parameters:
+        - name: channel
+          in: query
+          required: true
+          schema: { $ref: "#/components/schemas/FulfilmentChannel" }
+        - name: at
+          in: query
+          description: Evaluate day-part availability as of this instant. Defaults to now.
+          schema: { type: string, format: date-time }
+        - $ref: "#/components/parameters/IfNoneMatch"
+      responses:
+        "200":
+          description: Menu.
+          headers:
+            ETag: { schema: { type: string } }
+            Cache-Control: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Menu" }
+        "304": { description: Not modified. }
+
+  /products/{productId}:
+    parameters:
+      - name: productId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - name: outletId
+        in: query
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Menu]
+      summary: One dish with its modifier groups and upsells
+      security: []
+      responses:
+        "200":
+          description: Product.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProductDetail" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # -- Cart ------------------------------------------------------------------
+  /carts:
+    post:
+      tags: [Cart]
+      summary: Create a cart
+      security: []
+      description: |
+        Carts are server-side and work for guests. The client holds only the
+        cart id. Totals, tax, discounts and point accrual are computed here
+        and only here — a client-side total is a bug waiting to become a
+        chargeback.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [outletId, channel]
+              properties:
+                outletId: { type: string, format: uuid }
+                channel: { $ref: "#/components/schemas/FulfilmentChannel" }
+      responses:
+        "201":
+          description: Cart created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Cart" }
+
+  /carts/{cartId}:
+    parameters:
+      - $ref: "#/components/parameters/CartId"
+    get:
+      tags: [Cart]
+      summary: Get cart with fully priced lines
+      security: []
+      responses:
+        "200":
+          description: Cart.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Cart" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [Cart]
+      summary: Set fulfilment details on the cart
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                channel: { $ref: "#/components/schemas/FulfilmentChannel" }
+                addressId: { type: string, format: uuid, nullable: true }
+                address: { $ref: "#/components/schemas/AddressInput" }
+                slotId: { type: string, format: uuid, nullable: true }
+                scheduledFor: { type: string, format: date-time, nullable: true }
+                tipCents: { type: integer, minimum: 0 }
+                specialInstructions: { type: string, maxLength: 500 }
+      responses:
+        "200":
+          description: Repriced cart.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Cart" }
+        "422": { $ref: "#/components/responses/UnprocessableEntity" }
+
+  /carts/{cartId}/items:
+    parameters:
+      - $ref: "#/components/parameters/CartId"
+    post:
+      tags: [Cart]
+      summary: Add a line
+      security: []
+      description: |
+        The server re-validates every modifier selection against the group's
+        min/max and required rules. A client that sends an invalid combination
+        gets `422 cart/invalid-modifier-selection` naming the offending group.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CartItemInput" }
+      responses:
+        "200":
+          description: Repriced cart.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Cart" }
+        "409":
+          description: Item is sold out or out of its day-part window.
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+        "422": { $ref: "#/components/responses/UnprocessableEntity" }
+
+  /carts/{cartId}/items/{itemId}:
+    parameters:
+      - $ref: "#/components/parameters/CartId"
+      - name: itemId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    patch:
+      tags: [Cart]
+      summary: Change quantity or modifiers
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                quantity: { type: integer, minimum: 0, maximum: 99 }
+                modifiers:
+                  type: array
+                  items: { $ref: "#/components/schemas/ModifierSelectionInput" }
+                specialInstructions: { type: string, maxLength: 300 }
+      responses:
+        "200":
+          description: Repriced cart.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Cart" }
+    delete:
+      tags: [Cart]
+      summary: Remove a line
+      security: []
+      responses:
+        "200":
+          description: Repriced cart.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Cart" }
+
+  /carts/{cartId}/coupon:
+    parameters:
+      - $ref: "#/components/parameters/CartId"
+    post:
+      tags: [Cart, Coupons]
+      summary: Apply a coupon code
+      description: |
+        Validation is a dry run — it does not consume a redemption. The
+        redemption row is written inside the checkout transaction, which is
+        what enforces per-user and global caps under concurrency.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string }
+      responses:
+        "200":
+          description: Repriced cart.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Cart" }
+        "422":
+          description: |
+            Rejected. `type` is one of `coupon/expired`, `coupon/not-found`,
+            `coupon/min-order-not-met`, `coupon/already-used`,
+            `coupon/channel-ineligible`, `coupon/tier-ineligible`,
+            `coupon/not-stackable`.
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+    delete:
+      tags: [Cart, Coupons]
+      summary: Remove the applied coupon
+      responses:
+        "200":
+          description: Repriced cart.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Cart" }
+
+  /carts/{cartId}/points:
+    parameters:
+      - $ref: "#/components/parameters/CartId"
+    post:
+      tags: [Cart, Loyalty]
+      summary: Apply Gate Points to this cart
+      description: |
+        Points are *reserved*, not spent, until checkout succeeds. The
+        reservation expires with the cart.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [points]
+              properties:
+                points: { type: integer, minimum: 0 }
+      responses:
+        "200":
+          description: Repriced cart.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Cart" }
+        "422": { $ref: "#/components/responses/UnprocessableEntity" }
+
+  # -- Checkout & orders -----------------------------------------------------
+  /carts/{cartId}/checkout:
+    parameters:
+      - $ref: "#/components/parameters/CartId"
+      - $ref: "#/components/parameters/IdempotencyKey"
+    post:
+      tags: [Orders]
+      summary: Convert a cart into an order and open a payment intent
+      description: |
+        One transaction: re-price from live catalog, reserve stock and slot
+        capacity, write the coupon redemption, reserve points, create the
+        order in `PENDING_PAYMENT`, and enqueue the outbox event. If the
+        re-price differs from what the client last saw, the call fails with
+        `409 checkout/price-changed` carrying the new cart — the guest is
+        shown the difference and must re-confirm. Silent repricing is how you
+        get chargebacks.
+
+        The order is *not* sent to the kitchen here. That happens on the
+        payment webhook, so a failed 3DS challenge never reaches the pass.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [paymentMethodType, expectedTotalCents]
+              properties:
+                paymentMethodType: { $ref: "#/components/schemas/PaymentMethodType" }
+                savedPaymentMethodId: { type: string, format: uuid }
+                expectedTotalCents:
+                  type: integer
+                  description: What the guest was shown. Mismatch ⇒ 409.
+                guest: { $ref: "#/components/schemas/GuestContactInput" }
+                returnUrl:
+                  type: string
+                  format: uri
+                  description: Deep link for 3DS / PayNow return. Mobile passes its scheme.
+      responses:
+        "201":
+          description: Order created, payment pending.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  order: { $ref: "#/components/schemas/Order" }
+                  payment: { $ref: "#/components/schemas/PaymentIntent" }
+        "409":
+          description: Price changed, slot filled, or an item sold out mid-checkout.
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+        "422": { $ref: "#/components/responses/UnprocessableEntity" }
+
+  /orders:
+    get:
+      tags: [Orders]
+      summary: The signed-in guest's order history
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - name: status
+          in: query
+          schema:
+            type: array
+            items: { $ref: "#/components/schemas/OrderStatus" }
+          style: form
+          explode: false
+      responses:
+        "200":
+          description: Orders, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/OrderSummary" }
+                  pageInfo: { $ref: "#/components/schemas/PageInfo" }
+
+  /orders/{orderId}:
+    parameters:
+      - $ref: "#/components/parameters/OrderId"
+    get:
+      tags: [Orders]
+      summary: Full order
+      responses:
+        "200":
+          description: Order.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /orders/{orderId}/tracking:
+    parameters:
+      - $ref: "#/components/parameters/OrderId"
+    get:
+      tags: [Orders]
+      summary: Tracking snapshot — the reconnect path for the live socket
+      description: |
+        The app subscribes to `order:{orderId}` over the WebSocket gateway for
+        live updates and calls this once on mount and after any reconnect to
+        resync. Polling this endpoint is explicitly not the intended usage;
+        it is rate limited to 1 request per 10 seconds per order.
+      responses:
+        "200":
+          description: Tracking state.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OrderTracking" }
+
+  /orders/{orderId}/cancel:
+    parameters:
+      - $ref: "#/components/parameters/OrderId"
+      - $ref: "#/components/parameters/IdempotencyKey"
+    post:
+      tags: [Orders]
+      summary: Cancel
+      description: |
+        Allowed only while `status` is in `PLACED` or `CONFIRMED`. Once the
+        kitchen sets `PREPARING` the guest must call the outlet; the API
+        returns `409 order/not-cancellable` with the outlet phone in
+        `detail`. Cancelling releases slot capacity, reverses the coupon
+        redemption and returns reserved points.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string, maxLength: 300 }
+      responses:
+        "200":
+          description: Cancelled.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "409":
+          description: Too late to cancel.
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+
+  /orders/{orderId}/reorder:
+    parameters:
+      - $ref: "#/components/parameters/OrderId"
+    post:
+      tags: [Orders]
+      summary: Build a new cart from a past order
+      description: |
+        Items no longer on the menu are skipped and reported in
+        `unavailableItems` rather than silently dropped.
+      responses:
+        "201":
+          description: New cart.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cart: { $ref: "#/components/schemas/Cart" }
+                  unavailableItems:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        productName: { type: string }
+                        reason: { type: string }
+
+  # -- Catering --------------------------------------------------------------
+  /catering/packages:
+    get:
+      tags: [Catering]
+      summary: Browse catering packages
+      security: []
+      parameters:
+        - name: outletId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: eventType
+          in: query
+          schema: { $ref: "#/components/schemas/CateringEventType" }
+        - name: pax
+          in: query
+          description: Filter to packages whose minimumPax is at or below this.
+          schema: { type: integer, minimum: 1 }
+        - name: dietary
+          in: query
+          schema:
+            type: array
+            items: { $ref: "#/components/schemas/DietaryTag" }
+          style: form
+          explode: false
+      responses:
+        "200":
+          description: Packages.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/CateringPackageSummary" }
+
+  /catering/packages/{packageId}:
+    parameters:
+      - name: packageId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Catering]
+      summary: Package with its full course wizard definition
+      security: []
+      description: |
+        Returns the ordered `courses` array that drives the step-by-step
+        selector. Each course carries its own `minSelections`,
+        `maxSelections` and `includedSelections`, so the client renders and
+        validates the wizard entirely from data. Adding a "Soups" step is a
+        content change, not an app release.
+      responses:
+        "200":
+          description: Package.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CateringPackageDetail" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /catering/packages/{packageId}/availability:
+    parameters:
+      - name: packageId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Catering]
+      summary: Which event dates this package can still take
+      security: []
+      description: |
+        Drives the date picker's disabled days. Combines lead time, the
+        outlet's `maxEventsPerDay`, and blackout closures.
+      parameters:
+        - name: from
+          in: query
+          required: true
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          required: true
+          schema: { type: string, format: date }
+        - name: pax
+          in: query
+          schema: { type: integer }
+      responses:
+        "200":
+          description: Day-by-day availability.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  timezone: { type: string }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        date: { type: string, format: date }
+                        available: { type: boolean }
+                        reason:
+                          type: string
+                          enum: [LEAD_TIME, FULLY_BOOKED, OUTLET_CLOSED, BEYOND_HORIZON]
+                        remainingEvents: { type: integer }
+                        serviceWindows:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              startMinutes: { type: integer }
+                              endMinutes: { type: integer }
+
+  /catering/quote:
+    post:
+      tags: [Catering]
+      summary: Price a catering configuration without booking it
+      security: []
+      description: |
+        Pure function of the request — no rows written, no capacity held. The
+        wizard calls this on every step so the running total in the sticky
+        footer is always the server's number, not the client's arithmetic.
+        Debounce to 400ms.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CateringQuoteInput" }
+      responses:
+        "200":
+          description: Quote.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CateringQuote" }
+        "422":
+          description: |
+            Selection violates the package rules — `catering/course-min-not-met`,
+            `catering/course-max-exceeded`, `catering/below-minimum-pax`,
+            `catering/option-unavailable`.
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+
+  /catering/bookings:
+    post:
+      tags: [Catering]
+      summary: Submit a catering booking
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      description: |
+        Creates an `Order` of channel `CATERING` plus its `CateringOrder`
+        detail, reserves the event-day capacity, and opens a payment intent
+        for the deposit only. Bookings above the auto-confirm threshold land
+        in `ENQUIRY` for a manager to price manually rather than auto-taking
+        money for an event the kitchen may not be able to staff.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CateringBookingInput" }
+      responses:
+        "201":
+          description: Booking created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  booking: { $ref: "#/components/schemas/CateringBooking" }
+                  depositPayment:
+                    $ref: "#/components/schemas/PaymentIntent"
+        "409":
+          description: Date filled while the wizard was open.
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+    get:
+      tags: [Catering]
+      summary: The guest's catering bookings
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Bookings.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/CateringBooking" }
+                  pageInfo: { $ref: "#/components/schemas/PageInfo" }
+
+  /catering/bookings/{bookingId}:
+    parameters:
+      - name: bookingId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Catering]
+      summary: One booking
+      responses:
+        "200":
+          description: Booking.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CateringBooking" }
+    patch:
+      tags: [Catering]
+      summary: Amend menu, pax or event details
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      description: |
+        Rejected with `409 catering/menu-locked` once `menuLockedAt` has
+        passed — inside the lock window the kitchen has already ordered the
+        goods. Pax increases inside the window are allowed up to +10%; the
+        API returns the amended balance so the guest can pay the difference.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CateringAmendmentInput" }
+      responses:
+        "200":
+          description: Amended booking.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CateringBooking" }
+        "409":
+          description: Menu locked or version conflict.
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+
+  # -- Reservations ----------------------------------------------------------
+  /reservations/availability:
+    get:
+      tags: [Reservations]
+      summary: Bookable time slots for a date and party size
+      security: []
+      description: |
+        Returns every slot in the service window with its remaining covers, so
+        the UI can show "7:00 PM — full" rather than a gap. Slots where
+        `partySize` exceeds `autoConfirmMaxPax` come back with
+        `requiresApproval: true`; the client changes the CTA to "Request".
+      parameters:
+        - name: outletId
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+        - name: date
+          in: query
+          required: true
+          schema: { type: string, format: date }
+        - name: partySize
+          in: query
+          required: true
+          schema: { type: integer, minimum: 1, maximum: 200 }
+        - name: serviceAreaId
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Slots.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  timezone: { type: string }
+                  date: { type: string, format: date }
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/ReservationSlot" }
+
+  /reservations/availability/calendar:
+    get:
+      tags: [Reservations]
+      summary: Month view for the date picker
+      security: []
+      description: |
+        One call paints a whole month of enabled/disabled days. Without this
+        the picker fires a request per day and the calendar flickers.
+      parameters:
+        - name: outletId
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+        - name: month
+          in: query
+          required: true
+          schema: { type: string, pattern: "^\\d{4}-\\d{2}$" }
+        - name: partySize
+          in: query
+          required: true
+          schema: { type: integer, minimum: 1 }
+      responses:
+        "200":
+          description: Per-day summary.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        date: { type: string, format: date }
+                        status:
+                          type: string
+                          enum: [AVAILABLE, LIMITED, FULL, CLOSED, PAST]
+                        firstAvailableMinutes: { type: integer, nullable: true }
+
+  /reservations/holds:
+    post:
+      tags: [Reservations]
+      summary: Hold a slot while the guest fills in their details
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      security: []
+      description: |
+        The two-phase booking that stops the classic double-book. The hold
+        atomically increments `heldPax` on the slot row; if that would exceed
+        capacity the call returns `409 reservation/slot-unavailable` with the
+        nearest alternative slots so the UI can offer them inline. Holds
+        expire in 8 minutes and are swept back automatically — the client
+        should show the countdown.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [outletId, slotId, partySize]
+              properties:
+                outletId: { type: string, format: uuid }
+                slotId: { type: string, format: uuid }
+                partySize: { type: integer, minimum: 1 }
+                serviceAreaId: { type: string, format: uuid }
+      responses:
+        "201":
+          description: Hold created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  holdId: { type: string, format: uuid }
+                  expiresAt: { type: string, format: date-time }
+                  slot: { $ref: "#/components/schemas/ReservationSlot" }
+        "409":
+          description: Slot filled.
+          content:
+            application/problem+json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Problem"
+                  - type: object
+                    properties:
+                      alternatives:
+                        type: array
+                        items: { $ref: "#/components/schemas/ReservationSlot" }
+
+  /reservations:
+    post:
+      tags: [Reservations]
+      summary: Confirm a held slot into a reservation
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReservationInput" }
+      responses:
+        "201":
+          description: Reserved. `status` is CONFIRMED, or PENDING_CONFIRMATION for large parties.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Reservation" }
+        "409":
+          description: Hold expired. The client must re-check availability.
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+    get:
+      tags: [Reservations]
+      summary: The guest's reservations
+      parameters:
+        - name: upcoming
+          in: query
+          schema: { type: boolean, default: true }
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Reservations.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/Reservation" }
+                  pageInfo: { $ref: "#/components/schemas/PageInfo" }
+
+  /reservations/{reservationId}:
+    parameters:
+      - name: reservationId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Reservations]
+      summary: One reservation
+      responses:
+        "200":
+          description: Reservation.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Reservation" }
+    patch:
+      tags: [Reservations]
+      summary: Change time or party size
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      description: |
+        Modelled as hold-new-then-release-old inside one transaction, never as
+        a mutate-in-place — otherwise a failed move loses the original slot.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                slotId: { type: string, format: uuid }
+                partySize: { type: integer, minimum: 1 }
+                specialRequests: { type: string, maxLength: 500 }
+      responses:
+        "200":
+          description: Updated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Reservation" }
+        "409":
+          description: New slot unavailable; the original is untouched.
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+    delete:
+      tags: [Reservations]
+      summary: Cancel
+      responses:
+        "204": { description: Cancelled. }
+
+  # -- Loyalty ---------------------------------------------------------------
+  /loyalty/account:
+    get:
+      tags: [Loyalty]
+      summary: Gate Points balance, tier and next-tier progress
+      responses:
+        "200":
+          description: Account.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LoyaltyAccount" }
+
+  /loyalty/ledger:
+    get:
+      tags: [Loyalty]
+      summary: Point movement history
+      description: |
+        The ledger is the source of truth; `balancePoints` on the account is a
+        cache of it. Support answers "where did my points go" from here.
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Entries, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/LoyaltyLedgerEntry" }
+                  pageInfo: { $ref: "#/components/schemas/PageInfo" }
+
+  /loyalty/rewards:
+    get:
+      tags: [Loyalty]
+      summary: What points can buy
+      responses:
+        "200":
+          description: Rewards, with affordability computed for the caller.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/LoyaltyReward" }
+
+  /loyalty/rewards/{rewardId}/redeem:
+    parameters:
+      - name: rewardId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - $ref: "#/components/parameters/IdempotencyKey"
+    post:
+      tags: [Loyalty]
+      summary: Burn points for a reward
+      description: Mints a single-use coupon bound to the caller.
+      responses:
+        "201":
+          description: Redeemed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  couponCode: { type: string }
+                  expiresAt: { type: string, format: date-time }
+                  pointsSpent: { type: integer }
+                  balancePoints: { type: integer }
+        "422":
+          description: Insufficient points, tier locked, or out of stock.
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+
+  # -- Account ---------------------------------------------------------------
+  /me:
+    get:
+      tags: [Account]
+      summary: Current user
+      responses:
+        "200":
+          description: User.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+    patch:
+      tags: [Account]
+      summary: Update profile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                firstName: { type: string }
+                lastName: { type: string }
+                email: { type: string, format: email }
+                preferredLanguage: { type: string }
+                defaultSpiceLevel: { $ref: "#/components/schemas/SpiceLevel" }
+                marketingOptInPush: { type: boolean }
+                marketingOptInEmail: { type: boolean }
+                marketingOptInSms: { type: boolean }
+      responses:
+        "200":
+          description: Updated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+
+  /me/addresses:
+    get:
+      tags: [Account]
+      summary: Saved addresses
+      responses:
+        "200":
+          description: Addresses.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/Address" }
+    post:
+      tags: [Account]
+      summary: Save an address
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AddressInput" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Address" }
+
+  /me/devices:
+    post:
+      tags: [Account]
+      summary: Register or refresh a push token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DeviceRegistration" }
+      responses:
+        "204": { description: Registered. }
+
+  # -- Webhooks --------------------------------------------------------------
+  /webhooks/payments/{provider}:
+    parameters:
+      - name: provider
+        in: path
+        required: true
+        schema:
+          type: string
+          enum: [stripe, hitpay, razorpay]
+    post:
+      tags: [Webhooks]
+      summary: Payment provider callback
+      security: []
+      description: |
+        Signature-verified, replay-safe on the provider event id, and the only
+        place an order transitions from `PENDING_PAYMENT` to `PLACED`. Always
+        answers 200 once persisted; retries and ordering are handled by
+        writing the raw event first and processing asynchronously, because a
+        provider that gets a 500 will hammer this endpoint.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        "200": { description: Received. }
+        "400": { description: Signature verification failed. }
+
+  /webhooks/delivery/{provider}:
+    parameters:
+      - name: provider
+        in: path
+        required: true
+        schema:
+          type: string
+          enum: [lalamove, grab_express, pidge]
+    post:
+      tags: [Webhooks]
+      summary: Third-party courier status and location callback
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        "200": { description: Received. }
+
+# ============================================================================
+#  COMPONENTS
+# ============================================================================
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Short-lived (15 min) access token. `sub` is the user id; `roles` gates
+        the ops endpoints; `outletIds` scopes staff to their own locations.
+
+  parameters:
+    OutletId:
+      name: outletId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    CartId:
+      name: cartId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    OrderId:
+      name: orderId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-generated UUID v4. Retries with the same key replay the first response.
+      schema: { type: string, format: uuid }
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      description: The resource `version` the client last read.
+      schema: { type: string }
+    IfNoneMatch:
+      name: If-None-Match
+      in: header
+      schema: { type: string }
+
+  responses:
+    Unauthorized:
+      description: Missing, expired or replayed credentials.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    NotFound:
+      description: No such resource.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    UnprocessableEntity:
+      description: Semantically invalid. `errors` names the offending fields.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    TooManyRequests:
+      description: Rate limited.
+      headers:
+        Retry-After: { schema: { type: integer } }
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+
+  schemas:
+
+    Problem:
+      type: object
+      description: RFC 9457 problem document.
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          description: Stable machine-readable slug, e.g. `checkout/price-changed`.
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        traceId: { type: string }
+        errors:
+          type: array
+          description: Field-level detail for validation failures.
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              code: { type: string }
+              message: { type: string }
+
+    PageInfo:
+      type: object
+      properties:
+        nextCursor: { type: string, nullable: true }
+        hasMore: { type: boolean }
+
+    Money:
+      type: object
+      description: A displayable amount. `cents` is authoritative; `formatted` is a convenience so three clients do not each write a formatter.
+      required: [cents, currency]
+      properties:
+        cents: { type: integer }
+        currency: { type: string, minLength: 3, maxLength: 3 }
+        formatted: { type: string, examples: ["S$18.90"] }
+
+    FulfilmentChannel:
+      type: string
+      enum: [DELIVERY, PICKUP, DINE_IN, CATERING]
+
+    SpiceLevel:
+      type: string
+      enum: [NONE, MILD, MEDIUM, HOT, EXTRA_HOT]
+
+    DietaryTag:
+      type: string
+      enum:
+        [VEGETARIAN, VEGAN, JAIN, EGGLESS, HALAL, CONTAINS_NUTS, CONTAINS_DAIRY,
+         CONTAINS_GLUTEN, GLUTEN_FREE, CHEFS_SPECIAL, BESTSELLER, NEW]
+
+    OrderStatus:
+      type: string
+      enum:
+        [DRAFT, PENDING_PAYMENT, PAYMENT_FAILED, PLACED, CONFIRMED, PREPARING,
+         READY_FOR_PICKUP, AWAITING_DRIVER, OUT_FOR_DELIVERY, DELIVERED,
+         COMPLETED, CANCELLED, REFUNDED]
+
+    PaymentMethodType:
+      type: string
+      enum: [CARD, PAYNOW, GRABPAY, APPLE_PAY, GOOGLE_PAY, UPI, CASH_ON_DELIVERY, BANK_TRANSFER, STORE_CREDIT]
+
+    CateringEventType:
+      type: string
+      enum: [WEDDING, BIRTHDAY, CORPORATE, HOUSE_WARMING, RELIGIOUS_FUNCTION, FUNERAL, FESTIVAL, OTHER]
+
+    CateringServiceStyle:
+      type: string
+      enum: [DROP_OFF, BUFFET_SETUP, LIVE_COUNTER, FULL_SERVICE]
+
+    # -- Outlets -------------------------------------------------------------
+    Outlet:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        slug: { type: string }
+        name: { type: string }
+        phone: { type: string }
+        timezone: { type: string }
+        currency: { type: string }
+        address:
+          type: object
+          properties:
+            line1: { type: string }
+            line2: { type: string, nullable: true }
+            postalCode: { type: string }
+            city: { type: string }
+            country: { type: string }
+            latitude: { type: number }
+            longitude: { type: number }
+        channels:
+          type: array
+          items: { $ref: "#/components/schemas/FulfilmentChannel" }
+        isOpenNow: { type: boolean }
+        isAcceptingOrders: { type: boolean }
+        pauseReason: { type: string, nullable: true }
+        prepTimeMinutes: { type: integer }
+        distanceMetres: { type: integer, nullable: true }
+
+    OutletDetail:
+      allOf:
+        - $ref: "#/components/schemas/Outlet"
+        - type: object
+          properties:
+            description: { type: string, nullable: true }
+            openingHours:
+              type: array
+              items:
+                type: object
+                properties:
+                  dayOfWeek: { type: integer, minimum: 0, maximum: 6 }
+                  opensAtMinutes: { type: integer }
+                  closesAtMinutes: { type: integer }
+                  channel: { $ref: "#/components/schemas/FulfilmentChannel" }
+            upcomingClosures:
+              type: array
+              items:
+                type: object
+                properties:
+                  startsAt: { type: string, format: date-time }
+                  endsAt: { type: string, format: date-time }
+                  reason: { type: string }
+            minDeliveryOrder: { $ref: "#/components/schemas/Money" }
+
+    FulfilmentSlot:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        startsAt: { type: string, format: date-time }
+        endsAt: { type: string, format: date-time }
+        label: { type: string, examples: ["7:00 PM – 7:30 PM"] }
+        available: { type: boolean }
+        remainingOrders: { type: integer }
+        surchargeCents: { type: integer, default: 0 }
+
+    # -- Menu ----------------------------------------------------------------
+    Menu:
+      type: object
+      properties:
+        outletId: { type: string, format: uuid }
+        channel: { $ref: "#/components/schemas/FulfilmentChannel" }
+        generatedAt: { type: string, format: date-time }
+        version:
+          type: string
+          description: Content hash. The mobile cache keys on this.
+        categories:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string, format: uuid }
+              slug: { type: string }
+              name: { type: string }
+              imageUrl: { type: string, nullable: true }
+              products:
+                type: array
+                items: { $ref: "#/components/schemas/ProductSummary" }
+        modifierGroups:
+          type: array
+          description: |
+            Normalised out of the products and sent once. "Spice Level" is
+            attached to 40 dishes; inlining it 40 times triples the payload.
+            Products reference groups by id.
+          items: { $ref: "#/components/schemas/ModifierGroup" }
+
+    ProductSummary:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        slug: { type: string }
+        name: { type: string }
+        shortDescription: { type: string, nullable: true }
+        imageUrl: { type: string, nullable: true }
+        spiceLevel: { $ref: "#/components/schemas/SpiceLevel" }
+        dietaryTags:
+          type: array
+          items: { $ref: "#/components/schemas/DietaryTag" }
+        priceFrom: { $ref: "#/components/schemas/Money" }
+        compareAtPrice:
+          oneOf:
+            - $ref: "#/components/schemas/Money"
+            - type: "null"
+        availability: { $ref: "#/components/schemas/Availability" }
+        hasRequiredModifiers:
+          type: boolean
+          description: When false the client can quick-add without opening the sheet.
+        variants:
+          type: array
+          items: { $ref: "#/components/schemas/ProductVariant" }
+        modifierGroupIds:
+          type: array
+          items: { type: string, format: uuid }
+
+    ProductDetail:
+      allOf:
+        - $ref: "#/components/schemas/ProductSummary"
+        - type: object
+          properties:
+            description: { type: string, nullable: true }
+            galleryUrls:
+              type: array
+              items: { type: string }
+            allergens:
+              type: array
+              items: { type: string }
+            calories: { type: integer, nullable: true }
+            servesPax: { type: integer, nullable: true }
+            modifierGroups:
+              type: array
+              items: { $ref: "#/components/schemas/ModifierGroup" }
+            upsells:
+              type: array
+              items: { $ref: "#/components/schemas/ProductSummary" }
+            rating:
+              type: object
+              nullable: true
+              properties:
+                average: { type: number }
+                count: { type: integer }
+
+    ProductVariant:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        sku: { type: string }
+        name: { type: string, examples: ["Full"] }
+        price: { $ref: "#/components/schemas/Money" }
+        compareAtPrice:
+          oneOf:
+            - $ref: "#/components/schemas/Money"
+            - type: "null"
+        servesPax: { type: integer, nullable: true }
+        isDefault: { type: boolean }
+        availability: { $ref: "#/components/schemas/Availability" }
+
+    Availability:
+      type: object
+      properties:
+        available: { type: boolean }
+        reason:
+          type: string
+          enum: [AVAILABLE, SOLD_OUT, OUT_OF_SCHEDULE, OUTLET_CLOSED, DISCONTINUED]
+        availableFrom:
+          type: string
+          format: date-time
+          nullable: true
+          description: When known, lets the UI say "back at 5:00 PM".
+        quantityRemaining: { type: integer, nullable: true }
+
+    ModifierGroup:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        selectionType:
+          type: string
+          enum: [SINGLE_SELECT, MULTI_SELECT, QUANTITY]
+        isRequired: { type: boolean }
+        minSelections: { type: integer }
+        maxSelections: { type: integer }
+        options:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string, format: uuid }
+              name: { type: string }
+              priceDelta: { $ref: "#/components/schemas/Money" }
+              isDefault: { type: boolean }
+              available: { type: boolean }
+              dietaryTags:
+                type: array
+                items: { $ref: "#/components/schemas/DietaryTag" }
+
+    # -- Cart ----------------------------------------------------------------
+    ModifierSelectionInput:
+      type: object
+      required: [modifierOptionId]
+      properties:
+        modifierOptionId: { type: string, format: uuid }
+        quantity: { type: integer, minimum: 1, default: 1 }
+
+    CartItemInput:
+      type: object
+      required: [variantId, quantity]
+      properties:
+        variantId: { type: string, format: uuid }
+        quantity: { type: integer, minimum: 1, maximum: 99 }
+        modifiers:
+          type: array
+          items: { $ref: "#/components/schemas/ModifierSelectionInput" }
+        specialInstructions: { type: string, maxLength: 300 }
+
+    Cart:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        outletId: { type: string, format: uuid }
+        channel: { $ref: "#/components/schemas/FulfilmentChannel" }
+        version: { type: string }
+        expiresAt: { type: string, format: date-time }
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/CartItem" }
+        appliedCoupon:
+          type: object
+          nullable: true
+          properties:
+            code: { type: string }
+            label: { type: string }
+            discount: { $ref: "#/components/schemas/Money" }
+        pointsApplied: { type: integer }
+        totals: { $ref: "#/components/schemas/CartTotals" }
+        slot:
+          oneOf:
+            - $ref: "#/components/schemas/FulfilmentSlot"
+            - type: "null"
+        warnings:
+          type: array
+          description: Non-blocking issues — an item repriced, a slot expired.
+          items:
+            type: object
+            properties:
+              code: { type: string }
+              message: { type: string }
+              itemId: { type: string, format: uuid, nullable: true }
+
+    CartItem:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        variantId: { type: string, format: uuid }
+        productName: { type: string }
+        variantName: { type: string }
+        imageUrl: { type: string, nullable: true }
+        quantity: { type: integer }
+        unitPrice: { $ref: "#/components/schemas/Money" }
+        modifierTotal: { $ref: "#/components/schemas/Money" }
+        lineTotal: { $ref: "#/components/schemas/Money" }
+        modifiers:
+          type: array
+          items:
+            type: object
+            properties:
+              groupName: { type: string }
+              optionName: { type: string }
+              quantity: { type: integer }
+              priceDelta: { $ref: "#/components/schemas/Money" }
+        specialInstructions: { type: string, nullable: true }
+        availability: { $ref: "#/components/schemas/Availability" }
+
+    CartTotals:
+      type: object
+      description: Every line the receipt shows, computed server-side.
+      properties:
+        subtotal: { $ref: "#/components/schemas/Money" }
+        discountTotal: { $ref: "#/components/schemas/Money" }
+        deliveryFee: { $ref: "#/components/schemas/Money" }
+        packagingFee: { $ref: "#/components/schemas/Money" }
+        serviceCharge: { $ref: "#/components/schemas/Money" }
+        tax: { $ref: "#/components/schemas/Money" }
+        tip: { $ref: "#/components/schemas/Money" }
+        total: { $ref: "#/components/schemas/Money" }
+        pointsRedeemed: { type: integer }
+        pointsToEarn: { type: integer }
+        amountToFreeDelivery:
+          oneOf:
+            - $ref: "#/components/schemas/Money"
+            - type: "null"
+
+    # -- Orders --------------------------------------------------------------
+    GuestContactInput:
+      type: object
+      required: [name, phone]
+      properties:
+        name: { type: string }
+        phone: { type: string }
+        email: { type: string, format: email }
+
+    AddressInput:
+      type: object
+      required: [line1, postalCode]
+      properties:
+        label: { type: string }
+        type:
+          type: string
+          enum: [HOME, WORK, EVENT_VENUE, OTHER]
+        recipientName: { type: string }
+        recipientPhone: { type: string }
+        line1: { type: string }
+        line2: { type: string }
+        unitNumber: { type: string }
+        buildingName: { type: string }
+        postalCode: { type: string }
+        city: { type: string }
+        country: { type: string, minLength: 2, maxLength: 2 }
+        latitude: { type: number }
+        longitude: { type: number }
+        deliveryNotes: { type: string, maxLength: 300 }
+        isDefault: { type: boolean }
+
+    Address:
+      allOf:
+        - $ref: "#/components/schemas/AddressInput"
+        - type: object
+          properties:
+            id: { type: string, format: uuid }
+
+    PaymentIntent:
+      type: object
+      description: |
+        Provider-agnostic envelope. `clientSecret` is Stripe-shaped;
+        `redirectUrl` covers PayNow/HitPay; `qrCodeData` covers in-app PayNow.
+        Clients branch on `action`, never on the provider name.
+      properties:
+        paymentId: { type: string, format: uuid }
+        provider: { type: string }
+        action:
+          type: string
+          enum: [NONE, CONFIRM_ON_CLIENT, REDIRECT, DISPLAY_QR, POLL]
+        clientSecret: { type: string, nullable: true }
+        redirectUrl: { type: string, nullable: true }
+        qrCodeData: { type: string, nullable: true }
+        expiresAt: { type: string, format: date-time, nullable: true }
+        amount: { $ref: "#/components/schemas/Money" }
+
+    OrderSummary:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        orderNumber: { type: string }
+        outletName: { type: string }
+        channel: { $ref: "#/components/schemas/FulfilmentChannel" }
+        status: { $ref: "#/components/schemas/OrderStatus" }
+        placedAt: { type: string, format: date-time, nullable: true }
+        total: { $ref: "#/components/schemas/Money" }
+        itemCount: { type: integer }
+        thumbnailUrls:
+          type: array
+          items: { type: string }
+
+    Order:
+      allOf:
+        - $ref: "#/components/schemas/OrderSummary"
+        - type: object
+          properties:
+            version: { type: string }
+            outletId: { type: string, format: uuid }
+            items:
+              type: array
+              items: { $ref: "#/components/schemas/CartItem" }
+            totals: { $ref: "#/components/schemas/CartTotals" }
+            deliveryAddress:
+              oneOf:
+                - $ref: "#/components/schemas/Address"
+                - type: "null"
+            scheduledFor: { type: string, format: date-time, nullable: true }
+            promisedReadyAt: { type: string, format: date-time, nullable: true }
+            estimatedArrivalAt: { type: string, format: date-time, nullable: true }
+            pickupCode: { type: string, nullable: true }
+            specialInstructions: { type: string, nullable: true }
+            payments:
+              type: array
+              items:
+                type: object
+                properties:
+                  id: { type: string, format: uuid }
+                  methodType: { $ref: "#/components/schemas/PaymentMethodType" }
+                  status: { type: string }
+                  amount: { $ref: "#/components/schemas/Money" }
+                  cardLast4: { type: string, nullable: true }
+            canCancel: { type: boolean }
+            canReorder: { type: boolean }
+
+    OrderTracking:
+      type: object
+      properties:
+        orderId: { type: string, format: uuid }
+        status: { $ref: "#/components/schemas/OrderStatus" }
+        estimatedArrivalAt: { type: string, format: date-time, nullable: true }
+        timeline:
+          type: array
+          description: Replay of the append-only status log; drives the stepper.
+          items:
+            type: object
+            properties:
+              status: { $ref: "#/components/schemas/OrderStatus" }
+              occurredAt: { type: string, format: date-time }
+              label: { type: string }
+              note: { type: string, nullable: true }
+        driver:
+          type: object
+          nullable: true
+          description: |
+            Present only between PICKED_UP and DELIVERED. Location is coarse
+            for third-party couriers who only give us a tracking URL.
+          properties:
+            name: { type: string }
+            phoneMasked: { type: string }
+            vehicleType: { type: string }
+            latitude: { type: number, nullable: true }
+            longitude: { type: number, nullable: true }
+            headingDegrees: { type: integer, nullable: true }
+            lastPingAt: { type: string, format: date-time, nullable: true }
+            trackingUrl: { type: string, nullable: true }
+        route:
+          type: object
+          nullable: true
+          properties:
+            polyline: { type: string }
+            remainingMetres: { type: integer }
+            remainingSeconds: { type: integer }
+
+    # -- Catering ------------------------------------------------------------
+    CateringPackageSummary:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        slug: { type: string }
+        name: { type: string }
+        tagline: { type: string, nullable: true }
+        heroImageUrl: { type: string, nullable: true }
+        eventTypes:
+          type: array
+          items: { $ref: "#/components/schemas/CateringEventType" }
+        dietaryTags:
+          type: array
+          items: { $ref: "#/components/schemas/DietaryTag" }
+        minimumPax: { type: integer }
+        maximumPax: { type: integer, nullable: true }
+        paxStep:
+          type: integer
+          description: Increment for the pax stepper control.
+        priceFromPerPax: { $ref: "#/components/schemas/Money" }
+        minLeadTimeHours: { type: integer }
+
+    CateringPackageDetail:
+      allOf:
+        - $ref: "#/components/schemas/CateringPackageSummary"
+        - type: object
+          properties:
+            description: { type: string, nullable: true }
+            galleryUrls:
+              type: array
+              items: { type: string }
+            serviceStyles:
+              type: array
+              items: { $ref: "#/components/schemas/CateringServiceStyle" }
+            tiers:
+              type: array
+              description: Volume bands. The quote engine picks the band containing `pax`.
+              items:
+                type: object
+                properties:
+                  minPax: { type: integer }
+                  maxPax: { type: integer, nullable: true }
+                  pricePerPax: { $ref: "#/components/schemas/Money" }
+                  label: { type: string, nullable: true }
+            courses:
+              type: array
+              description: Ordered wizard steps.
+              items: { $ref: "#/components/schemas/CateringCourse" }
+            addOns:
+              type: array
+              items:
+                type: object
+                properties:
+                  id: { type: string, format: uuid }
+                  name: { type: string }
+                  description: { type: string, nullable: true }
+                  pricingModel:
+                    type: string
+                    enum: [PER_EVENT, PER_PAX, PER_UNIT]
+                  price: { $ref: "#/components/schemas/Money" }
+                  maxQuantity: { type: integer, nullable: true }
+            depositPercent: { type: number, examples: [30] }
+            menuLockHoursBefore: { type: integer }
+            cancellationPolicy: { type: string, nullable: true }
+
+    CateringCourse:
+      type: object
+      description: |
+        One step of the selector, e.g. "Starters — choose any 3". The client
+        renders and validates purely from these numbers.
+      properties:
+        id: { type: string, format: uuid }
+        stepIndex: { type: integer }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        imageUrl: { type: string, nullable: true }
+        isRequired: { type: boolean }
+        minSelections: { type: integer }
+        maxSelections: { type: integer }
+        includedSelections:
+          type: integer
+          description: Picks beyond this are billed at the option's surcharge.
+        allowDuplicates: { type: boolean }
+        options:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string, format: uuid }
+              productId: { type: string, format: uuid }
+              name: { type: string }
+              description: { type: string, nullable: true }
+              imageUrl: { type: string, nullable: true }
+              spiceLevel: { $ref: "#/components/schemas/SpiceLevel" }
+              dietaryTags:
+                type: array
+                items: { $ref: "#/components/schemas/DietaryTag" }
+              surchargePerPax: { $ref: "#/components/schemas/Money" }
+              isRecommended: { type: boolean }
+              available: { type: boolean }
+
+    CateringSelectionInput:
+      type: object
+      required: [courseId, optionIds]
+      properties:
+        courseId: { type: string, format: uuid }
+        optionIds:
+          type: array
+          items: { type: string, format: uuid }
+
+    CateringQuoteInput:
+      type: object
+      required: [packageId, pax, selections]
+      properties:
+        packageId: { type: string, format: uuid }
+        pax: { type: integer, minimum: 1 }
+        serviceStyle: { $ref: "#/components/schemas/CateringServiceStyle" }
+        eventDate: { type: string, format: date }
+        selections:
+          type: array
+          items: { $ref: "#/components/schemas/CateringSelectionInput" }
+        addOns:
+          type: array
+          items:
+            type: object
+            properties:
+              addOnId: { type: string, format: uuid }
+              quantity: { type: integer, minimum: 1 }
+        staffCount: { type: integer, minimum: 0 }
+        couponCode: { type: string }
+
+    CateringQuote:
+      type: object
+      properties:
+        packageId: { type: string, format: uuid }
+        pax: { type: integer }
+        tierLabel: { type: string, nullable: true }
+        pricePerPax: { $ref: "#/components/schemas/Money" }
+        lines:
+          type: array
+          description: Itemised so the guest sees exactly what the upcharges are.
+          items:
+            type: object
+            properties:
+              kind:
+                type: string
+                enum: [BASE_PER_PAX, COURSE_SURCHARGE, ADD_ON, SETUP_FEE, STAFF_FEE, DISCOUNT, TAX]
+              label: { type: string }
+              quantity: { type: integer, nullable: true }
+              unitAmount:
+                oneOf:
+                  - $ref: "#/components/schemas/Money"
+                  - type: "null"
+              amount: { $ref: "#/components/schemas/Money" }
+        subtotal: { $ref: "#/components/schemas/Money" }
+        discountTotal: { $ref: "#/components/schemas/Money" }
+        tax: { $ref: "#/components/schemas/Money" }
+        total: { $ref: "#/components/schemas/Money" }
+        depositDue: { $ref: "#/components/schemas/Money" }
+        balanceDue: { $ref: "#/components/schemas/Money" }
+        validation:
+          type: object
+          description: Per-step completeness, so the wizard can enable "Next".
+          properties:
+            isComplete: { type: boolean }
+            courses:
+              type: array
+              items:
+                type: object
+                properties:
+                  courseId: { type: string, format: uuid }
+                  selectedCount: { type: integer }
+                  isSatisfied: { type: boolean }
+                  message: { type: string, nullable: true }
+
+    CateringBookingInput:
+      allOf:
+        - $ref: "#/components/schemas/CateringQuoteInput"
+        - type: object
+          required: [eventDate, serviceStartMinutes, contact, venueAddress, expectedTotalCents]
+          properties:
+            eventType: { $ref: "#/components/schemas/CateringEventType" }
+            serviceStartMinutes:
+              type: integer
+              description: Local minutes from midnight at the outlet. 1170 = 19:30.
+            serviceEndMinutes: { type: integer, nullable: true }
+            setupByMinutes: { type: integer, nullable: true }
+            venueName: { type: string }
+            venueAddress: { $ref: "#/components/schemas/AddressInput" }
+            venueNotes: { type: string, maxLength: 1000 }
+            hasLift: { type: boolean }
+            parkingNotes: { type: string }
+            contact: { $ref: "#/components/schemas/GuestContactInput" }
+            altContactPhone: { type: string }
+            specialRequirements: { type: string, maxLength: 2000 }
+            dietaryNotes: { type: string, maxLength: 1000 }
+            expectedTotalCents:
+              type: integer
+              description: The quote total the guest agreed to. Mismatch ⇒ 409.
+
+    CateringBooking:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        orderId: { type: string, format: uuid }
+        orderNumber: { type: string }
+        version: { type: string }
+        stage:
+          type: string
+          enum: [ENQUIRY, QUOTED, DEPOSIT_PENDING, DEPOSIT_PAID, CONFIRMED, MENU_LOCKED, IN_PREPARATION, DISPATCHED, SERVED, COMPLETED, CANCELLED]
+        packageName: { type: string }
+        eventType: { $ref: "#/components/schemas/CateringEventType" }
+        serviceStyle: { $ref: "#/components/schemas/CateringServiceStyle" }
+        eventDate: { type: string, format: date }
+        serviceStartMinutes: { type: integer }
+        pax: { type: integer }
+        quote: { $ref: "#/components/schemas/CateringQuote" }
+        venueAddress: { $ref: "#/components/schemas/Address" }
+        contact: { $ref: "#/components/schemas/GuestContactInput" }
+        selections:
+          type: array
+          items:
+            type: object
+            properties:
+              courseName: { type: string }
+              stepIndex: { type: integer }
+              items:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    productName: { type: string }
+                    surchargePerPax: { $ref: "#/components/schemas/Money" }
+        depositPaidAt: { type: string, format: date-time, nullable: true }
+        balanceDueAt: { type: string, format: date-time, nullable: true }
+        menuLockedAt: { type: string, format: date-time, nullable: true }
+        canAmendMenu: { type: boolean }
+        assignedManagerName: { type: string, nullable: true }
+
+    CateringAmendmentInput:
+      type: object
+      properties:
+        pax: { type: integer, minimum: 1 }
+        selections:
+          type: array
+          items: { $ref: "#/components/schemas/CateringSelectionInput" }
+        addOns:
+          type: array
+          items:
+            type: object
+            properties:
+              addOnId: { type: string, format: uuid }
+              quantity: { type: integer }
+        serviceStartMinutes: { type: integer }
+        specialRequirements: { type: string }
+
+    # -- Reservations --------------------------------------------------------
+    ReservationSlot:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        startsAt: { type: string, format: date-time }
+        startMinutes:
+          type: integer
+          description: Local minutes from midnight — render this, do not convert the instant on-device.
+        label: { type: string, examples: ["7:30 PM"] }
+        durationMinutes: { type: integer }
+        available: { type: boolean }
+        remainingPax: { type: integer }
+        requiresApproval:
+          type: boolean
+          description: Party exceeds the schedule's auto-confirm ceiling.
+        serviceAreaId: { type: string, format: uuid, nullable: true }
+        serviceAreaName: { type: string, nullable: true }
+
+    ReservationInput:
+      type: object
+      required: [holdId, guestName, guestPhone, partySize]
+      properties:
+        holdId: { type: string, format: uuid }
+        guestName: { type: string }
+        guestPhone: { type: string }
+        guestEmail: { type: string, format: email }
+        partySize: { type: integer, minimum: 1 }
+        occasion: { type: string }
+        specialRequests: { type: string, maxLength: 500 }
+        highChairCount: { type: integer, minimum: 0 }
+        wheelchairAccess: { type: boolean }
+        marketingOptIn: { type: boolean }
+
+    Reservation:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        reservationCode: { type: string }
+        version: { type: string }
+        outletId: { type: string, format: uuid }
+        outletName: { type: string }
+        status:
+          type: string
+          enum: [HELD, PENDING_CONFIRMATION, CONFIRMED, SEATED, COMPLETED, CANCELLED_BY_GUEST, CANCELLED_BY_OUTLET, NO_SHOW, EXPIRED]
+        reservedFor: { type: string, format: date-time }
+        localDate: { type: string, format: date }
+        localTimeLabel: { type: string, examples: ["7:30 PM"] }
+        partySize: { type: integer }
+        durationMinutes: { type: integer }
+        serviceAreaName: { type: string, nullable: true }
+        occasion: { type: string, nullable: true }
+        specialRequests: { type: string, nullable: true }
+        canModify: { type: boolean }
+        canCancel: { type: boolean }
+        cancellationDeadline: { type: string, format: date-time, nullable: true }
+
+    # -- Loyalty -------------------------------------------------------------
+    LoyaltyAccount:
+      type: object
+      properties:
+        balancePoints: { type: integer }
+        lifetimePoints: { type: integer }
+        pointValue:
+          $ref: "#/components/schemas/Money"
+          description: Cash value of one point, for the "≈ S$4.50" hint.
+        tier:
+          type: object
+          properties:
+            code: { type: string, enum: [BRONZE, SILVER, GOLD, PLATINUM] }
+            name: { type: string }
+            earnMultiplier: { type: number, examples: [1.25] }
+            colorHex: { type: string, nullable: true }
+        nextTier:
+          type: object
+          nullable: true
+          properties:
+            code: { type: string }
+            name: { type: string }
+            pointsNeeded: { type: integer }
+            progressPercent: { type: number }
+        expiringSoon:
+          type: object
+          nullable: true
+          description: Drives the "1,200 points expire on 30 Sep" nudge.
+          properties:
+            points: { type: integer }
+            expiresAt: { type: string, format: date-time }
+
+    LoyaltyLedgerEntry:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        type:
+          type: string
+          enum: [EARN_ORDER, EARN_REFERRAL, EARN_SIGNUP_BONUS, EARN_PROMOTION, EARN_REVIEW, REDEEM_ORDER, REDEEM_REWARD, EXPIRE, REVERSAL, MANUAL_ADJUSTMENT]
+        points: { type: integer, description: Signed. }
+        description: { type: string }
+        orderNumber: { type: string, nullable: true }
+        expiresAt: { type: string, format: date-time, nullable: true }
+        createdAt: { type: string, format: date-time }
+
+    LoyaltyReward:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        imageUrl: { type: string, nullable: true }
+        pointsCost: { type: integer }
+        canRedeem: { type: boolean }
+        lockedReason:
+          type: string
+          nullable: true
+          enum: [INSUFFICIENT_POINTS, TIER_LOCKED, OUT_OF_STOCK, EXPIRED]
+
+    # -- Identity ------------------------------------------------------------
+    AuthSession:
+      type: object
+      properties:
+        accessToken: { type: string }
+        refreshToken: { type: string }
+        expiresIn: { type: integer, description: Seconds. }
+        isNewUser: { type: boolean }
+        user: { $ref: "#/components/schemas/User" }
+
+    DeviceRegistration:
+      type: object
+      required: [platform]
+      properties:
+        pushToken: { type: string }
+        platform: { type: string, enum: [ios, android, web] }
+        appVersion: { type: string }
+        osVersion: { type: string }
+
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        phone: { type: string, nullable: true }
+        email: { type: string, nullable: true }
+        firstName: { type: string, nullable: true }
+        lastName: { type: string, nullable: true }
+        avatarUrl: { type: string, nullable: true }
+        preferredLanguage: { type: string }
+        defaultSpiceLevel: { $ref: "#/components/schemas/SpiceLevel" }
+        roles:
+          type: array
+          items: { type: string }
+        loyalty:
+          oneOf:
+            - $ref: "#/components/schemas/LoyaltyAccount"
+            - type: "null"
+
+# ============================================================================
+#  REAL-TIME CHANNELS (not REST; documented here so there is one contract)
+# ============================================================================
+x-realtime-channels:
+  transport: >
+    Socket.IO over WebSocket at wss://rt.indiagate.sg, authenticated with the
+    same access token in the connect payload. Redis adapter for fan-out across
+    API instances. Events originate from the transactional outbox relay, never
+    from application code emitting directly — that is what keeps the socket
+    stream consistent with the database.
+  channels:
+    - name: "order:{orderId}"
+      access: The order's owner, or staff at its outlet.
+      events:
+        - name: order.status_changed
+          payload: "{ orderId, status, occurredAt, estimatedArrivalAt, label }"
+        - name: order.eta_updated
+          payload: "{ orderId, estimatedArrivalAt, remainingSeconds }"
+        - name: order.driver_assigned
+          payload: "{ orderId, driver: { name, phoneMasked, vehicleType } }"
+        - name: order.driver_location
+          payload: "{ orderId, latitude, longitude, headingDegrees, recordedAt }"
+          notes: >
+            Throttled to one emit per 5 seconds per order. The client
+            interpolates between pings rather than snapping the marker.
+        - name: order.cancelled
+          payload: "{ orderId, reason, refund }"
+    - name: "outlet:{outletId}:kds"
+      access: KITCHEN_STAFF and OUTLET_MANAGER of that outlet.
+      events:
+        - name: order.placed
+        - name: order.amended
+        - name: order.cancelled
+        - name: availability.changed
+    - name: "user:{userId}"
+      access: The user.
+      events:
+        - name: loyalty.points_earned
+        - name: reservation.confirmed
+        - name: catering.stage_changed
+    - name: "outlet:{outletId}:floor"
+      access: Front-of-house staff.
+      events:
+        - name: reservation.created
+        - name: reservation.cancelled
+        - name: reservation.seated

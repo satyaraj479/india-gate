@@ -1,0 +1,25 @@
+{
+  "name": "@indiagate/database",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./client": "./generated/client/index.js"
+  },
+  "scripts": {
+    "generate": "prisma generate",
+    "migrate:dev": "prisma migrate dev",
+    "migrate:deploy": "prisma migrate deploy",
+    "studio": "prisma studio",
+    "seed": "tsx prisma/seed.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "prisma": { "seed": "tsx prisma/seed.ts" },
+  "dependencies": { "@prisma/client": "^5.22.0" },
+  "devDependencies": {
+    "@indiagate/tsconfig": "workspace:*",
+    "prisma": "^5.22.0",
+    "tsx": "^4.19.1"
+  }
+}

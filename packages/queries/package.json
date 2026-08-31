@@ -1,0 +1,22 @@
+{
+  "name": "@indiagate/queries",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./provider": "./src/provider.tsx"
+  },
+  "scripts": { "typecheck": "tsc --noEmit", "test": "vitest run" },
+  "dependencies": {
+    "@indiagate/contracts": "workspace:*",
+    "@indiagate/core": "workspace:*",
+    "@tanstack/react-query": "^5.59.0"
+  },
+  "peerDependencies": { "react": ">=18.3.0" },
+  "devDependencies": {
+    "@indiagate/tsconfig": "workspace:*",
+    "@types/react": "^18.3.11",
+    "vitest": "^2.1.2"
+  }
+}

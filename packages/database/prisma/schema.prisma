@@ -1,0 +1,2009 @@
+// ============================================================================
+//  India Gate — PostgreSQL schema (Prisma)
+// ----------------------------------------------------------------------------
+//  Conventions used throughout this schema:
+//
+//  1. MONEY is stored as an integer in the currency's minor unit (SGD cents).
+//     Never Float. Every money-bearing row carries the currency it was
+//     denominated in so historical rows survive a currency change.
+//  2. HISTORICAL ROWS SNAPSHOT. OrderItem / CateringOrderSelection / Payment
+//     copy the name, price and configuration that applied at the moment of
+//     purchase. Nothing that renders a past receipt joins to a live catalog
+//     row, because catalog rows get renamed, repriced and soft-deleted.
+//  3. APPEND-ONLY LEDGERS are the source of truth for anything a customer can
+//     dispute: order status history, loyalty points, stock movement. Balances
+//     on the aggregate rows are derived caches, rebuildable from the ledger.
+//  4. SOFT DELETE (deletedAt) on catalog entities only. Transactional rows are
+//     never deleted; they are cancelled.
+//  5. All timestamps are timestamptz. The app layer works in Asia/Singapore
+//     but the database stores UTC. Business-day boundaries are computed with
+//     the outlet's `timezone`, never the server's.
+// ============================================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions", "relationJoins"]
+  output          = "../generated/client"
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  directUrl  = env("DIRECT_DATABASE_URL")
+  extensions = [pgcrypto, citext, postgis(schema: "public")]
+}
+
+// ============================================================================
+//  ENUMS
+// ============================================================================
+
+enum UserRole {
+  CUSTOMER
+  DRIVER
+  KITCHEN_STAFF
+  OUTLET_MANAGER
+  CATERING_MANAGER
+  ADMIN
+  SUPER_ADMIN
+}
+
+enum AuthProvider {
+  PHONE_OTP
+  EMAIL_PASSWORD
+  GOOGLE
+  APPLE
+  FACEBOOK
+}
+
+enum AddressType {
+  HOME
+  WORK
+  EVENT_VENUE
+  OTHER
+}
+
+enum FulfilmentChannel {
+  DELIVERY
+  PICKUP
+  DINE_IN
+  CATERING
+}
+
+enum SpiceLevel {
+  NONE
+  MILD
+  MEDIUM
+  HOT
+  EXTRA_HOT
+}
+
+enum DietaryTag {
+  VEGETARIAN
+  VEGAN
+  JAIN
+  EGGLESS
+  HALAL
+  CONTAINS_NUTS
+  CONTAINS_DAIRY
+  CONTAINS_GLUTEN
+  GLUTEN_FREE
+  CHEFS_SPECIAL
+  BESTSELLER
+  NEW
+}
+
+enum ProductStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+/// Why an item is unavailable. SOLD_OUT is set by staff ("86 the vada"),
+/// OUT_OF_SCHEDULE is derived from day-part rules, and the two are separated
+/// so the UI can say "back at 5pm" instead of a flat "unavailable".
+enum AvailabilityReason {
+  AVAILABLE
+  SOLD_OUT
+  OUT_OF_SCHEDULE
+  OUTLET_CLOSED
+  DISCONTINUED
+}
+
+enum ModifierSelectionType {
+  SINGLE_SELECT
+  MULTI_SELECT
+  QUANTITY
+}
+
+enum OrderStatus {
+  DRAFT // cart, not yet submitted
+  PENDING_PAYMENT
+  PAYMENT_FAILED
+  PLACED // paid or COD accepted; kitchen has not seen it
+  CONFIRMED // outlet accepted
+  PREPARING
+  READY_FOR_PICKUP
+  AWAITING_DRIVER
+  OUT_FOR_DELIVERY
+  DELIVERED
+  COMPLETED
+  CANCELLED
+  REFUNDED
+}
+
+enum PaymentStatus {
+  REQUIRES_PAYMENT_METHOD
+  REQUIRES_ACTION
+  PROCESSING
+  AUTHORIZED
+  CAPTURED
+  FAILED
+  CANCELLED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+enum PaymentMethodType {
+  CARD
+  PAYNOW
+  GRABPAY
+  APPLE_PAY
+  GOOGLE_PAY
+  UPI
+  CASH_ON_DELIVERY
+  BANK_TRANSFER
+  STORE_CREDIT
+}
+
+enum DeliveryProvider {
+  IN_HOUSE
+  LALAMOVE
+  GRAB_EXPRESS
+  PIDGE
+  DUNZO
+}
+
+enum DeliveryJobStatus {
+  UNASSIGNED
+  ASSIGNED
+  DRIVER_EN_ROUTE_TO_OUTLET
+  ARRIVED_AT_OUTLET
+  PICKED_UP
+  EN_ROUTE_TO_CUSTOMER
+  ARRIVED_AT_CUSTOMER
+  DELIVERED
+  FAILED
+  RETURNED
+}
+
+enum CateringEventType {
+  WEDDING
+  BIRTHDAY
+  CORPORATE
+  HOUSE_WARMING
+  RELIGIOUS_FUNCTION
+  FUNERAL
+  FESTIVAL
+  OTHER
+}
+
+enum CateringServiceStyle {
+  DROP_OFF
+  BUFFET_SETUP
+  LIVE_COUNTER
+  FULL_SERVICE
+}
+
+enum CateringOrderStage {
+  ENQUIRY
+  QUOTED
+  DEPOSIT_PENDING
+  DEPOSIT_PAID
+  CONFIRMED
+  MENU_LOCKED
+  IN_PREPARATION
+  DISPATCHED
+  SERVED
+  COMPLETED
+  CANCELLED
+}
+
+enum ReservationStatus {
+  HELD // temporary lock while the guest completes the form
+  PENDING_CONFIRMATION
+  CONFIRMED
+  SEATED
+  COMPLETED
+  CANCELLED_BY_GUEST
+  CANCELLED_BY_OUTLET
+  NO_SHOW
+  EXPIRED
+}
+
+enum TableShape {
+  SQUARE
+  ROUND
+  RECTANGLE
+  BOOTH
+  BAR
+  HIGH_TOP
+}
+
+/// Every movement of Gate Points. The LoyaltyAccount balance is a cache of
+/// SUM(points) over non-void entries.
+enum LoyaltyEntryType {
+  EARN_ORDER
+  EARN_REFERRAL
+  EARN_SIGNUP_BONUS
+  EARN_PROMOTION
+  EARN_REVIEW
+  REDEEM_ORDER
+  REDEEM_REWARD
+  EXPIRE
+  REVERSAL // order refunded, claw back the points
+  MANUAL_ADJUSTMENT
+}
+
+enum LoyaltyTierCode {
+  BRONZE
+  SILVER
+  GOLD
+  PLATINUM
+}
+
+enum CouponType {
+  PERCENTAGE_OFF
+  FIXED_AMOUNT_OFF
+  FREE_DELIVERY
+  FREE_ITEM
+  BUY_X_GET_Y
+  POINTS_MULTIPLIER
+}
+
+enum CouponScope {
+  CART
+  ITEM
+  DELIVERY_FEE
+}
+
+enum DiscountSource {
+  COUPON
+  LOYALTY_POINTS
+  AUTOMATIC_PROMOTION
+  TIER_BENEFIT
+  MANUAL_STAFF_DISCOUNT
+  PACKAGE_TIER
+}
+
+enum NotificationChannel {
+  PUSH
+  SMS
+  EMAIL
+  WHATSAPP
+  IN_APP
+}
+
+enum OutboxStatus {
+  PENDING
+  PUBLISHED
+  FAILED
+  DEAD_LETTER
+}
+
+// ============================================================================
+//  TENANCY & OUTLETS
+// ============================================================================
+
+model Outlet {
+  id           String  @id @default(uuid()) @db.Uuid
+  slug         String  @unique @db.Citext
+  name         String
+  description  String?
+  phone        String
+  email        String?
+  /// IANA zone, e.g. "Asia/Singapore". All business-day and slot maths use
+  /// this, never the server clock.
+  timezone     String  @default("Asia/Singapore")
+  currency     String  @default("SGD") @db.Char(3)
+  /// Tax rate in basis points. 900 = 9% GST.
+  taxRateBps   Int     @default(900)
+  taxInclusive Boolean @default(true)
+
+  addressLine1 String
+  addressLine2 String?
+  postalCode   String
+  city         String
+  country      String  @db.Char(2)
+  latitude     Decimal @db.Decimal(9, 6)
+  longitude    Decimal @db.Decimal(9, 6)
+
+  supportsDelivery   Boolean @default(true)
+  supportsPickup     Boolean @default(true)
+  supportsDineIn     Boolean @default(true)
+  supportsCatering   Boolean @default(true)
+  supportsReservation Boolean @default(true)
+
+  /// Guardrails the checkout service reads before it will accept an order.
+  minDeliveryOrderCents Int @default(0)
+  deliveryBaseFeeCents  Int @default(0)
+  /// Kitchen throughput. The slot service refuses to promise a delivery
+  /// window that would exceed this many orders in a 15-minute bucket.
+  maxOrdersPerSlot      Int @default(12)
+  prepTimeMinutes       Int @default(25)
+
+  isActive     Boolean   @default(true)
+  /// Manual kill switch used during a rush; distinct from isActive so the
+  /// outlet page still renders with a "not accepting orders" banner.
+  isAcceptingOrders Boolean @default(true)
+  pausedUntil  DateTime? @db.Timestamptz(3)
+  pauseReason  String?
+
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(3)
+  deletedAt DateTime? @db.Timestamptz(3)
+
+  openingHours        OutletOpeningHour[]
+  closures            OutletClosure[]
+  deliveryZones       DeliveryZone[]
+  menus               Menu[]
+  productAvailability OutletProductAvailability[]
+  priceOverrides      PriceOverride[]
+  orders              Order[]
+  serviceAreas        ServiceArea[]
+  tables              RestaurantTable[]
+  serviceSchedules    ServiceSchedule[]
+  slotInventory       SlotInventory[]
+  reservations        Reservation[]
+  cateringPackages    CateringPackage[]
+  staff               StaffAssignment[]
+  stockMovements      StockMovement[]
+
+  @@index([isActive, deletedAt])
+  @@map("outlets")
+}
+
+model OutletOpeningHour {
+  id       String @id @default(uuid()) @db.Uuid
+  outletId String @db.Uuid
+  outlet   Outlet @relation(fields: [outletId], references: [id], onDelete: Cascade)
+
+  /// 0 = Sunday .. 6 = Saturday
+  dayOfWeek Int
+  /// Minutes from local midnight. 660 = 11:00. Using minutes rather than TIME
+  /// lets a late-night service cross midnight as 1380 -> 1560.
+  opensAtMinutes  Int
+  closesAtMinutes Int
+  channel         FulfilmentChannel?
+
+  @@unique([outletId, dayOfWeek, opensAtMinutes, channel])
+  @@index([outletId, dayOfWeek])
+  @@map("outlet_opening_hours")
+}
+
+/// Public holidays, Deepavali closure, renovation. Beats a boolean flag
+/// because the app can show the reason and the reopen date.
+model OutletClosure {
+  id        String   @id @default(uuid()) @db.Uuid
+  outletId  String   @db.Uuid
+  outlet    Outlet   @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  startsAt  DateTime @db.Timestamptz(3)
+  endsAt    DateTime @db.Timestamptz(3)
+  reason    String
+  channels  FulfilmentChannel[]
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([outletId, startsAt, endsAt])
+  @@map("outlet_closures")
+}
+
+/// Delivery pricing by postal-code prefix or radius band. Kept as data, not
+/// code, because ops changes these weekly without a deploy.
+model DeliveryZone {
+  id       String @id @default(uuid()) @db.Uuid
+  outletId String @db.Uuid
+  outlet   Outlet @relation(fields: [outletId], references: [id], onDelete: Cascade)
+
+  name              String
+  /// Either a set of postal prefixes OR a radius band; the resolver checks
+  /// postal prefixes first and falls back to distance.
+  postalPrefixes    String[]
+  minDistanceMetres Int?
+  maxDistanceMetres Int?
+
+  feeCents             Int
+  minOrderCents        Int  @default(0)
+  freeDeliveryAboveCents Int?
+  etaMinutes           Int  @default(45)
+  isActive             Boolean @default(true)
+  priority             Int     @default(0)
+
+  @@index([outletId, isActive, priority])
+  @@map("delivery_zones")
+}
+
+// ============================================================================
+//  IDENTITY
+// ============================================================================
+
+model User {
+  id          String  @id @default(uuid()) @db.Uuid
+  /// E.164. Primary identifier in this market — most guests never set a
+  /// password and sign in by OTP.
+  phone       String? @unique
+  email       String? @unique @db.Citext
+  firstName   String?
+  lastName    String?
+  displayName String?
+  avatarUrl   String?
+  dateOfBirth DateTime? @db.Date
+
+  phoneVerifiedAt DateTime? @db.Timestamptz(3)
+  emailVerifiedAt DateTime? @db.Timestamptz(3)
+
+  roles UserRole[] @default([CUSTOMER])
+
+  preferredLanguage String     @default("en")
+  defaultSpiceLevel SpiceLevel @default(MEDIUM)
+  dietaryTags       DietaryTag[]
+
+  marketingOptInEmail Boolean @default(false)
+  marketingOptInSms   Boolean @default(false)
+  marketingOptInPush  Boolean @default(true)
+
+  /// Set when the guest asks for deletion; the row is retained because orders
+  /// reference it, but PII is scrubbed by a background job.
+  anonymisedAt DateTime? @db.Timestamptz(3)
+
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(3)
+  lastSeenAt DateTime? @db.Timestamptz(3)
+
+  identities      AuthIdentity[]
+  sessions        Session[]
+  addresses       Address[]
+  devices         Device[]
+  orders          Order[]
+  reservations    Reservation[]
+  cateringOrders  CateringOrder[]
+  loyaltyAccount  LoyaltyAccount?
+  couponRedemptions CouponRedemption[]
+  reviews         Review[]
+  staffAssignments StaffAssignment[]
+  driverProfile   DriverProfile?
+  notifications   NotificationLog[]
+  savedPaymentMethods SavedPaymentMethod[]
+  referralsMade   Referral[]        @relation("referrer")
+  referralReceived Referral?        @relation("referee")
+
+  @@index([createdAt])
+  @@map("users")
+}
+
+model AuthIdentity {
+  id         String       @id @default(uuid()) @db.Uuid
+  userId     String       @db.Uuid
+  user       User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider   AuthProvider
+  /// Provider's stable subject id. For PHONE_OTP this is the E.164 number,
+  /// for EMAIL_PASSWORD the email.
+  providerUserId String
+  /// Argon2id hash. Null for every provider except EMAIL_PASSWORD.
+  passwordHash   String?
+  metadata       Json?
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+  lastUsedAt     DateTime? @db.Timestamptz(3)
+
+  @@unique([provider, providerUserId])
+  @@index([userId])
+  @@map("auth_identities")
+}
+
+model Session {
+  id               String   @id @default(uuid()) @db.Uuid
+  userId           String   @db.Uuid
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// SHA-256 of the refresh token; the raw value never touches the database.
+  refreshTokenHash String   @unique
+  /// Rotation chain — lets us detect refresh-token replay and revoke the
+  /// whole family.
+  familyId         String   @db.Uuid
+  deviceId         String?  @db.Uuid
+  device           Device?  @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+  userAgent        String?
+  ipAddress        String?
+  expiresAt        DateTime @db.Timestamptz(3)
+  revokedAt        DateTime? @db.Timestamptz(3)
+  createdAt        DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([userId, revokedAt])
+  @@index([familyId])
+  @@map("sessions")
+}
+
+model Device {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String?  @db.Uuid
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  /// Expo push token or FCM/APNs token.
+  pushToken  String?  @unique
+  platform   String // ios | android | web
+  appVersion String?
+  osVersion  String?
+  /// Set when the push provider returns DeviceNotRegistered so we stop
+  /// pushing to dead tokens.
+  disabledAt DateTime? @db.Timestamptz(3)
+  createdAt  DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt  DateTime @updatedAt @db.Timestamptz(3)
+
+  sessions Session[]
+
+  @@index([userId, disabledAt])
+  @@map("devices")
+}
+
+model Address {
+  id           String      @id @default(uuid()) @db.Uuid
+  userId       String      @db.Uuid
+  user         User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  label        String?
+  type         AddressType @default(HOME)
+  recipientName String?
+  recipientPhone String?
+  line1        String
+  line2        String?
+  unitNumber   String?
+  buildingName String?
+  postalCode   String
+  city         String
+  country      String      @db.Char(2)
+  latitude     Decimal?    @db.Decimal(9, 6)
+  longitude    Decimal?    @db.Decimal(9, 6)
+  deliveryNotes String?
+  isDefault    Boolean     @default(false)
+  createdAt    DateTime    @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime    @updatedAt @db.Timestamptz(3)
+  deletedAt    DateTime?   @db.Timestamptz(3)
+
+  @@index([userId, deletedAt])
+  @@map("addresses")
+}
+
+model StaffAssignment {
+  id       String   @id @default(uuid()) @db.Uuid
+  userId   String   @db.Uuid
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  outletId String   @db.Uuid
+  outlet   Outlet   @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  role     UserRole
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@unique([userId, outletId, role])
+  @@map("staff_assignments")
+}
+
+model DriverProfile {
+  id            String  @id @default(uuid()) @db.Uuid
+  userId        String  @unique @db.Uuid
+  user          User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  vehicleType   String // bike | car | van
+  vehiclePlate  String?
+  isOnShift     Boolean @default(false)
+  currentLatitude  Decimal? @db.Decimal(9, 6)
+  currentLongitude Decimal? @db.Decimal(9, 6)
+  lastPingAt    DateTime? @db.Timestamptz(3)
+
+  deliveryJobs DeliveryJob[]
+
+  @@index([isOnShift, lastPingAt])
+  @@map("driver_profiles")
+}
+
+// ============================================================================
+//  CATALOG — categories, products, variants, modifiers
+// ============================================================================
+
+/// A Menu scopes a set of categories to an outlet and a channel. The same
+/// dish can sit in the delivery menu at one price and the catering menu at
+/// another without duplicating the product row.
+model Menu {
+  id          String            @id @default(uuid()) @db.Uuid
+  outletId    String            @db.Uuid
+  outlet      Outlet            @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  name        String
+  channel     FulfilmentChannel
+  /// Day-part window in local minutes-from-midnight. Null = all day.
+  activeFromMinutes Int?
+  activeToMinutes   Int?
+  activeDaysOfWeek  Int[]
+  isDefault   Boolean  @default(false)
+  sortOrder   Int      @default(0)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @db.Timestamptz(3)
+
+  sections MenuSection[]
+
+  @@unique([outletId, channel, name])
+  @@index([outletId, channel, isActive])
+  @@map("menus")
+}
+
+model MenuSection {
+  id         String   @id @default(uuid()) @db.Uuid
+  menuId     String   @db.Uuid
+  menu       Menu     @relation(fields: [menuId], references: [id], onDelete: Cascade)
+  categoryId String   @db.Uuid
+  category   Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  sortOrder  Int      @default(0)
+
+  @@unique([menuId, categoryId])
+  @@map("menu_sections")
+}
+
+model Category {
+  id          String  @id @default(uuid()) @db.Uuid
+  slug        String  @unique @db.Citext
+  name        String
+  description String?
+  imageUrl    String?
+  /// Self-reference: "Tiffin" -> "Dosa", "Idli". Two levels is all the UI
+  /// renders; the constraint is enforced in the service, not the schema.
+  parentId    String?  @db.Uuid
+  parent      Category? @relation("CategoryTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children    Category[] @relation("CategoryTree")
+
+  sortOrder Int       @default(0)
+  isActive  Boolean   @default(true)
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(3)
+  deletedAt DateTime? @db.Timestamptz(3)
+
+  products     Product[]
+  menuSections MenuSection[]
+
+  @@index([parentId, sortOrder])
+  @@map("categories")
+}
+
+model Product {
+  id          String  @id @default(uuid()) @db.Uuid
+  slug        String  @unique @db.Citext
+  categoryId  String  @db.Uuid
+  category    Category @relation(fields: [categoryId], references: [id])
+
+  name         String
+  shortDescription String?
+  description  String?
+  /// Localised copy, keyed by BCP-47 tag: { "ta": { "name": "..." } }.
+  translations Json?
+
+  imageUrl      String?
+  galleryUrls   String[]
+  /// Ordered list; the app shows the first that loads.
+  videoUrl      String?
+
+  spiceLevel   SpiceLevel  @default(MEDIUM)
+  dietaryTags  DietaryTag[]
+  allergens    String[]
+  /// Free text the kitchen cares about: "contains curry leaves", "cooked in
+  /// coconut oil".
+  ingredientNotes String?
+  calories     Int?
+  servesPax    Int? @default(1)
+  prepTimeMinutes Int?
+
+  status    ProductStatus @default(DRAFT)
+  sortOrder Int           @default(0)
+
+  /// Channel eligibility. A biryani handi may be catering-only.
+  availableChannels FulfilmentChannel[] @default([DELIVERY, PICKUP, DINE_IN])
+
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(3)
+  deletedAt DateTime? @db.Timestamptz(3)
+
+  variants            ProductVariant[]
+  modifierGroups      ProductModifierGroup[]
+  outletAvailability  OutletProductAvailability[]
+  cateringOptions     CateringCourseOption[]
+  reviews             Review[]
+  relatedTo           ProductRelation[] @relation("source")
+  relatedFrom         ProductRelation[] @relation("target")
+
+  @@index([categoryId, status, sortOrder])
+  @@index([status, deletedAt])
+  @@map("products")
+}
+
+/// Upsell / "goes well with" edges, used by both the item sheet and the cart
+/// recommender. Directional so "Biryani -> Raita" does not imply the reverse.
+model ProductRelation {
+  id        String  @id @default(uuid()) @db.Uuid
+  sourceId  String  @db.Uuid
+  source    Product @relation("source", fields: [sourceId], references: [id], onDelete: Cascade)
+  targetId  String  @db.Uuid
+  target    Product @relation("target", fields: [targetId], references: [id], onDelete: Cascade)
+  kind      String // UPSELL | PAIRS_WITH | SUBSTITUTE
+  sortOrder Int     @default(0)
+
+  @@unique([sourceId, targetId, kind])
+  @@map("product_relations")
+}
+
+/// Price lives here, not on Product. "Half / Full", "Regular / Family Pack",
+/// "1kg / 2kg handi" are all variants of one dish.
+model ProductVariant {
+  id        String  @id @default(uuid()) @db.Uuid
+  productId String  @db.Uuid
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  sku       String  @unique
+  name      String // "Half", "Full", "Serves 4"
+  basePriceCents Int
+  /// Shown struck through when set and higher than basePriceCents.
+  compareAtPriceCents Int?
+  currency  String  @db.Char(3) @default("SGD")
+
+  weightGrams Int?
+  servesPax   Int? @default(1)
+
+  isDefault Boolean @default(false)
+  sortOrder Int     @default(0)
+  isActive  Boolean @default(true)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  priceOverrides     PriceOverride[]
+  outletAvailability OutletProductAvailability[]
+  orderItems         OrderItem[]
+  stockMovements     StockMovement[]
+  cateringOptions    CateringCourseOption[]
+
+  @@index([productId, isActive, sortOrder])
+  @@map("product_variants")
+}
+
+/// Delivery prices are commonly 10–15% above dine-in to absorb aggregator
+/// economics. Modelled as data so finance can change it without a migration.
+model PriceOverride {
+  id        String            @id @default(uuid()) @db.Uuid
+  variantId String            @db.Uuid
+  variant   ProductVariant    @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  outletId  String?           @db.Uuid
+  outlet    Outlet?           @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  channel   FulfilmentChannel?
+  priceCents Int
+  startsAt  DateTime?         @db.Timestamptz(3)
+  endsAt    DateTime?         @db.Timestamptz(3)
+
+  @@unique([variantId, outletId, channel, startsAt])
+  @@index([variantId, channel])
+  @@map("price_overrides")
+}
+
+/// Per-outlet stock/86 state. Absence of a row means "available".
+model OutletProductAvailability {
+  id        String  @id @default(uuid()) @db.Uuid
+  outletId  String  @db.Uuid
+  outlet    Outlet  @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  productId String  @db.Uuid
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  variantId String? @db.Uuid
+  variant   ProductVariant? @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  reason AvailabilityReason @default(AVAILABLE)
+  /// Null = indefinite. Set to end-of-service so tomorrow's menu self-heals.
+  unavailableUntil DateTime? @db.Timestamptz(3)
+  /// Optional hard count for limited items ("only 20 mysore pak today").
+  quantityRemaining Int?
+
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+  updatedBy String?  @db.Uuid
+
+  @@unique([outletId, productId, variantId])
+  @@index([outletId, reason])
+  @@map("outlet_product_availability")
+}
+
+/// Append-only stock movement for the limited-quantity items above. Lets the
+/// team answer "who 86'd the vada and when".
+model StockMovement {
+  id        String   @id @default(uuid()) @db.Uuid
+  outletId  String   @db.Uuid
+  outlet    Outlet   @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  variantId String   @db.Uuid
+  variant   ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  delta     Int
+  reason    String // OPENING_COUNT | ORDER_RESERVED | ORDER_CANCELLED | WASTAGE | RESTOCK
+  orderId   String?  @db.Uuid
+  actorId   String?  @db.Uuid
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([outletId, variantId, createdAt])
+  @@map("stock_movements")
+}
+
+// ---------------------------------------------------------------------------
+//  Modifiers / customisations
+// ---------------------------------------------------------------------------
+
+/// Reusable across products: one "Spice Level" group attaches to forty dishes.
+model ModifierGroup {
+  id            String                @id @default(uuid()) @db.Uuid
+  name          String
+  internalName  String                @unique
+  description   String?
+  selectionType ModifierSelectionType @default(SINGLE_SELECT)
+  minSelections Int                   @default(0)
+  maxSelections Int                   @default(1)
+  /// For QUANTITY groups: cap on the sum of option quantities.
+  maxTotalQuantity Int?
+  isActive      Boolean               @default(true)
+  createdAt     DateTime              @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime              @updatedAt @db.Timestamptz(3)
+
+  options  ModifierOption[]
+  products ProductModifierGroup[]
+
+  @@map("modifier_groups")
+}
+
+model ModifierOption {
+  id              String        @id @default(uuid()) @db.Uuid
+  modifierGroupId String        @db.Uuid
+  modifierGroup   ModifierGroup @relation(fields: [modifierGroupId], references: [id], onDelete: Cascade)
+
+  name         String
+  description  String?
+  /// Signed: "no onion" can be 0, "extra ghee" +150, a downgrade -100.
+  priceDeltaCents Int    @default(0)
+  imageUrl     String?
+  dietaryTags  DietaryTag[]
+  /// Preselected when the sheet opens.
+  isDefault    Boolean @default(false)
+  sortOrder    Int     @default(0)
+  isActive     Boolean @default(true)
+  /// Optional link to a stock-tracked variant, so "add raita" decrements raita.
+  linkedVariantId String? @db.Uuid
+
+  orderItemModifiers OrderItemModifier[]
+
+  @@index([modifierGroupId, sortOrder])
+  @@map("modifier_options")
+}
+
+/// Join with per-product overrides — "Spice Level" is required on curries and
+/// optional on desserts without cloning the group.
+model ProductModifierGroup {
+  id              String        @id @default(uuid()) @db.Uuid
+  productId       String        @db.Uuid
+  product         Product       @relation(fields: [productId], references: [id], onDelete: Cascade)
+  modifierGroupId String        @db.Uuid
+  modifierGroup   ModifierGroup @relation(fields: [modifierGroupId], references: [id], onDelete: Cascade)
+
+  isRequired         Boolean @default(false)
+  minSelectionsOverride Int?
+  maxSelectionsOverride Int?
+  sortOrder          Int     @default(0)
+
+  @@unique([productId, modifierGroupId])
+  @@index([productId, sortOrder])
+  @@map("product_modifier_groups")
+}
+
+// ============================================================================
+//  ORDERS
+// ============================================================================
+
+model Order {
+  id           String  @id @default(uuid()) @db.Uuid
+  /// Human-facing, e.g. "IG-2608-4417". Generated from a per-outlet sequence.
+  orderNumber  String  @unique
+  outletId     String  @db.Uuid
+  outlet       Outlet  @relation(fields: [outletId], references: [id])
+  userId       String? @db.Uuid
+  user         User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  /// Guest checkout: no user row, but we still need to reach them.
+  guestName    String?
+  guestPhone   String?
+  guestEmail   String?
+
+  channel FulfilmentChannel
+  status  OrderStatus       @default(DRAFT)
+
+  // -- Fulfilment -----------------------------------------------------------
+  /// Guest-requested window. Null = ASAP.
+  scheduledFor      DateTime? @db.Timestamptz(3)
+  slotInventoryId   String?   @db.Uuid
+  slotInventory     SlotInventory? @relation(fields: [slotInventoryId], references: [id], onDelete: SetNull)
+  promisedReadyAt   DateTime? @db.Timestamptz(3)
+  /// Recomputed as the order moves; what the tracking screen counts down to.
+  estimatedArrivalAt DateTime? @db.Timestamptz(3)
+
+  /// Address is SNAPSHOT, not a foreign key — the guest may edit or delete
+  /// the saved address afterwards and the delivery record must not change.
+  deliveryAddress   Json?
+  deliveryZoneId    String?  @db.Uuid
+  deliveryNotes     String?
+  contactlessDelivery Boolean @default(false)
+
+  pickupCode String? // shown at the counter for PICKUP
+
+  // -- Money. Every figure is stored, never recomputed on read. -------------
+  currency            String @db.Char(3) @default("SGD")
+  subtotalCents       Int    @default(0)
+  discountTotalCents  Int    @default(0)
+  deliveryFeeCents    Int    @default(0)
+  packagingFeeCents   Int    @default(0)
+  serviceChargeCents  Int    @default(0)
+  taxCents            Int    @default(0)
+  tipCents            Int    @default(0)
+  roundingAdjustmentCents Int @default(0)
+  totalCents          Int    @default(0)
+  /// Gate Points burnt on this order and the cash value applied.
+  pointsRedeemed      Int    @default(0)
+  pointsEarned        Int    @default(0)
+
+  /// Client-supplied UUID. Unique so a retried checkout from a flaky mobile
+  /// connection cannot create a second order.
+  idempotencyKey String? @unique
+
+  specialInstructions String?
+  cancellationReason  String?
+  cancelledAt         DateTime? @db.Timestamptz(3)
+  placedAt            DateTime? @db.Timestamptz(3)
+  completedAt         DateTime? @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  items         OrderItem[]
+  statusEvents  OrderStatusEvent[]
+  payments      Payment[]
+  refunds       Refund[]
+  discounts     OrderDiscount[]
+  deliveryJob   DeliveryJob?
+  cateringOrder CateringOrder?
+  loyaltyEntries LoyaltyLedgerEntry[]
+  couponRedemptions CouponRedemption[]
+  review        Review?
+  reservation   Reservation?
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([outletId, status, createdAt(sort: Desc)])
+  @@index([status, scheduledFor])
+  @@map("orders")
+}
+
+model OrderItem {
+  id      String @id @default(uuid()) @db.Uuid
+  orderId String @db.Uuid
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  /// Kept for analytics joins. onDelete: SetNull — the snapshot below is what
+  /// the receipt renders, so losing the catalog row is survivable.
+  variantId String?         @db.Uuid
+  variant   ProductVariant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
+
+  // -- Snapshot at time of order -------------------------------------------
+  productName  String
+  variantName  String
+  sku          String?
+  imageUrl     String?
+  categoryName String?
+
+  quantity        Int
+  unitPriceCents  Int
+  /// Sum of modifier deltas × their quantities, per unit.
+  modifierTotalCents Int @default(0)
+  /// (unitPriceCents + modifierTotalCents) × quantity − lineDiscountCents
+  lineTotalCents  Int
+  lineDiscountCents Int @default(0)
+
+  specialInstructions String?
+  /// Set when this line came from a catering course selector rather than the
+  /// a la carte cart.
+  cateringSelectionId String? @db.Uuid
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  modifiers OrderItemModifier[]
+
+  @@index([orderId])
+  @@index([variantId])
+  @@map("order_items")
+}
+
+model OrderItemModifier {
+  id          String    @id @default(uuid()) @db.Uuid
+  orderItemId String    @db.Uuid
+  orderItem   OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+
+  modifierOptionId String?         @db.Uuid
+  modifierOption   ModifierOption? @relation(fields: [modifierOptionId], references: [id], onDelete: SetNull)
+
+  // Snapshot
+  groupName       String
+  optionName      String
+  quantity        Int @default(1)
+  priceDeltaCents Int @default(0)
+
+  @@index([orderItemId])
+  @@map("order_item_modifiers")
+}
+
+/// Append-only. The tracking screen replays this; the KDS writes to it; the
+/// Order.status column is a cache of the newest row.
+model OrderStatusEvent {
+  id       String      @id @default(uuid()) @db.Uuid
+  orderId  String      @db.Uuid
+  order    Order       @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  fromStatus OrderStatus?
+  toStatus OrderStatus
+  /// user id, "system", or an integration name.
+  actorId  String?     @db.Uuid
+  actorType String     @default("SYSTEM")
+  note     String?
+  metadata Json?
+  createdAt DateTime   @default(now()) @db.Timestamptz(3)
+
+  @@index([orderId, createdAt])
+  @@map("order_status_events")
+}
+
+model OrderDiscount {
+  id       String         @id @default(uuid()) @db.Uuid
+  orderId  String         @db.Uuid
+  order    Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  source   DiscountSource
+  /// Snapshot of the coupon code / promotion name shown on the receipt.
+  label    String
+  couponId String?        @db.Uuid
+  coupon   Coupon?        @relation(fields: [couponId], references: [id], onDelete: SetNull)
+  amountCents Int
+  /// Which line it applied to, for item-scoped coupons.
+  orderItemId String?     @db.Uuid
+  metadata Json?
+  createdAt DateTime      @default(now()) @db.Timestamptz(3)
+
+  @@index([orderId])
+  @@map("order_discounts")
+}
+
+// ---------------------------------------------------------------------------
+//  Payments
+// ---------------------------------------------------------------------------
+
+model Payment {
+  id      String @id @default(uuid()) @db.Uuid
+  orderId String @db.Uuid
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  provider   String // stripe | hitpay | razorpay | adyen
+  /// Provider's PaymentIntent / charge id. Unique so a replayed webhook is a
+  /// no-op rather than a double capture.
+  providerPaymentId String? @unique
+  methodType PaymentMethodType
+  status     PaymentStatus     @default(REQUIRES_PAYMENT_METHOD)
+
+  amountCents Int
+  currency    String @db.Char(3) @default("SGD")
+  /// What the provider kept; needed for reconciliation, not shown to guests.
+  feeCents    Int?
+
+  /// Last four / brand only. No PAN, ever.
+  cardBrand    String?
+  cardLast4    String?
+  walletType   String?
+
+  failureCode    String?
+  failureMessage String?
+
+  authorizedAt DateTime? @db.Timestamptz(3)
+  capturedAt   DateTime? @db.Timestamptz(3)
+  createdAt    DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime  @updatedAt @db.Timestamptz(3)
+
+  refunds Refund[]
+
+  @@index([orderId, status])
+  @@map("payments")
+}
+
+model SavedPaymentMethod {
+  id       String @id @default(uuid()) @db.Uuid
+  userId   String @db.Uuid
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider String
+  /// Provider vault token. We never see the card itself.
+  providerMethodId String
+  methodType PaymentMethodType
+  cardBrand  String?
+  cardLast4  String?
+  expiryMonth Int?
+  expiryYear  Int?
+  isDefault  Boolean @default(false)
+  createdAt  DateTime @default(now()) @db.Timestamptz(3)
+  deletedAt  DateTime? @db.Timestamptz(3)
+
+  @@unique([provider, providerMethodId])
+  @@index([userId, deletedAt])
+  @@map("saved_payment_methods")
+}
+
+model Refund {
+  id        String  @id @default(uuid()) @db.Uuid
+  orderId   String  @db.Uuid
+  order     Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  paymentId String  @db.Uuid
+  payment   Payment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  providerRefundId String? @unique
+  amountCents Int
+  currency    String  @db.Char(3) @default("SGD")
+  reason      String
+  status      PaymentStatus @default(PROCESSING)
+  initiatedBy String? @db.Uuid
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+  completedAt DateTime? @db.Timestamptz(3)
+
+  @@index([orderId])
+  @@map("refunds")
+}
+
+// ---------------------------------------------------------------------------
+//  Delivery & tracking
+// ---------------------------------------------------------------------------
+
+model DeliveryJob {
+  id      String @id @default(uuid()) @db.Uuid
+  orderId String @unique @db.Uuid
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  provider          DeliveryProvider  @default(IN_HOUSE)
+  providerJobId     String?           @unique
+  status            DeliveryJobStatus @default(UNASSIGNED)
+
+  driverId String?        @db.Uuid
+  driver   DriverProfile? @relation(fields: [driverId], references: [id], onDelete: SetNull)
+  /// For 3PL jobs where we get a name but not a user row.
+  externalDriverName  String?
+  externalDriverPhone String?
+  /// The provider's own tracking page, shown when we do not own the driver.
+  trackingUrl String?
+
+  pickupEtaAt   DateTime? @db.Timestamptz(3)
+  droppedEtaAt  DateTime? @db.Timestamptz(3)
+  pickedUpAt    DateTime? @db.Timestamptz(3)
+  deliveredAt   DateTime? @db.Timestamptz(3)
+
+  distanceMetres Int?
+  proofPhotoUrl  String?
+  recipientName  String?
+  failureReason  String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  locationPings DriverLocationPing[]
+
+  @@index([status, createdAt])
+  @@index([driverId, status])
+  @@map("delivery_jobs")
+}
+
+/// High-volume, low-value. Retained ~7 days then dropped by a partition
+/// rotation job — this table is a time-series, not a record of account.
+model DriverLocationPing {
+  id            String      @id @default(uuid()) @db.Uuid
+  deliveryJobId String      @db.Uuid
+  deliveryJob   DeliveryJob @relation(fields: [deliveryJobId], references: [id], onDelete: Cascade)
+  latitude      Decimal     @db.Decimal(9, 6)
+  longitude     Decimal     @db.Decimal(9, 6)
+  headingDegrees Int?
+  speedKph      Decimal?    @db.Decimal(5, 2)
+  accuracyMetres Int?
+  recordedAt    DateTime    @db.Timestamptz(3)
+
+  @@index([deliveryJobId, recordedAt(sort: Desc)])
+  @@map("driver_location_pings")
+}
+
+// ============================================================================
+//  CATERING
+// ============================================================================
+
+/// A sellable bulk package: "Wedding Deluxe — Vegetarian". Priced per pax,
+/// banded by headcount, and composed of courses the guest picks from.
+model CateringPackage {
+  id       String  @id @default(uuid()) @db.Uuid
+  outletId String  @db.Uuid
+  outlet   Outlet  @relation(fields: [outletId], references: [id], onDelete: Cascade)
+
+  slug        String  @unique @db.Citext
+  name        String
+  tagline     String?
+  description String?
+  heroImageUrl String?
+  galleryUrls String[]
+
+  eventTypes   CateringEventType[]
+  serviceStyles CateringServiceStyle[]
+  dietaryTags  DietaryTag[]
+
+  /// The pax counter on the package page starts here and cannot go below it.
+  minimumPax    Int  @default(30)
+  maximumPax    Int?
+  /// Counter granularity — many kitchens quote in multiples of 10.
+  paxStep       Int  @default(5)
+
+  /// Fallback when no tier band matches. Tiers below take precedence.
+  basePricePerPaxCents Int
+  currency      String @db.Char(3) @default("SGD")
+
+  /// Guardrails the booking service enforces before accepting a date.
+  minLeadTimeHours   Int @default(72)
+  maxLeadTimeDays    Int @default(180)
+  /// How many packages this outlet can serve on one calendar day.
+  maxEventsPerDay    Int @default(3)
+
+  depositPercentBps  Int  @default(3000) // 30%
+  /// Hours before the event after which the menu can no longer be edited.
+  menuLockHoursBefore Int @default(72)
+  cancellationPolicy String?
+  /// Setup, delivery, staffing and equipment charged on top of per-pax.
+  setupFeeCents      Int  @default(0)
+  perStaffFeeCents   Int  @default(0)
+
+  isActive  Boolean   @default(true)
+  sortOrder Int       @default(0)
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(3)
+  deletedAt DateTime? @db.Timestamptz(3)
+
+  tiers   CateringPackageTier[]
+  courses CateringCourse[]
+  addOns  CateringAddOn[]
+  orders  CateringOrder[]
+
+  @@index([outletId, isActive, sortOrder])
+  @@map("catering_packages")
+}
+
+/// Volume bands: 30–59 pax at $28, 60–119 at $24, 120+ at $21.
+model CateringPackageTier {
+  id        String          @id @default(uuid()) @db.Uuid
+  packageId String          @db.Uuid
+  package   CateringPackage @relation(fields: [packageId], references: [id], onDelete: Cascade)
+  minPax    Int
+  maxPax    Int?
+  pricePerPaxCents Int
+  label     String?
+
+  @@unique([packageId, minPax])
+  @@index([packageId, minPax])
+  @@map("catering_package_tiers")
+}
+
+/// One step of the wizard: "Starters — choose any 3", "Biryani — choose 1",
+/// "Naan & Breads — choose up to 2", "Desserts — choose 2".
+model CateringCourse {
+  id        String          @id @default(uuid()) @db.Uuid
+  packageId String          @db.Uuid
+  package   CateringPackage @relation(fields: [packageId], references: [id], onDelete: Cascade)
+
+  name        String // "Starters"
+  description String?
+  /// Drives wizard ordering. The client walks courses by stepIndex.
+  stepIndex   Int
+
+  /// The selection contract for this step.
+  minSelections Int @default(1)
+  maxSelections Int @default(1)
+  /// How many are covered by the package price; anything beyond this many
+  /// selections is billed at the option's surcharge.
+  includedSelections Int @default(1)
+  /// Can the guest pick the same dish twice (e.g. two portions of one item)?
+  allowDuplicates Boolean @default(false)
+  isRequired      Boolean @default(true)
+
+  imageUrl  String?
+  sortOrder Int     @default(0)
+
+  options CateringCourseOption[]
+
+  @@unique([packageId, stepIndex])
+  @@index([packageId, sortOrder])
+  @@map("catering_courses")
+}
+
+/// A dish offered inside a course, with an optional upcharge for premium
+/// picks ("Mutton Biryani +$4/pax inside a veg package").
+model CateringCourseOption {
+  id       String         @id @default(uuid()) @db.Uuid
+  courseId String         @db.Uuid
+  course   CateringCourse @relation(fields: [courseId], references: [id], onDelete: Cascade)
+
+  productId String  @db.Uuid
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  variantId String? @db.Uuid
+  variant   ProductVariant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
+
+  /// Charged per head, on top of the tier price, when selected.
+  surchargePerPaxCents Int @default(0)
+  /// Hide from the picker without deleting historical selections.
+  isActive  Boolean @default(true)
+  sortOrder Int     @default(0)
+  /// Marks the option the wizard preselects.
+  isRecommended Boolean @default(false)
+
+  selections CateringSelection[]
+
+  @@unique([courseId, productId, variantId])
+  @@index([courseId, isActive, sortOrder])
+  @@map("catering_course_options")
+}
+
+/// Extras bolted on outside the course structure: chafing dishes, servers,
+/// live dosa counter, cutlery, delivery beyond the base radius.
+model CateringAddOn {
+  id        String          @id @default(uuid()) @db.Uuid
+  packageId String          @db.Uuid
+  package   CateringPackage @relation(fields: [packageId], references: [id], onDelete: Cascade)
+  name      String
+  description String?
+  /// PER_EVENT | PER_PAX | PER_UNIT
+  pricingModel String       @default("PER_EVENT")
+  priceCents Int
+  maxQuantity Int?
+  isActive  Boolean @default(true)
+  sortOrder Int     @default(0)
+
+  selections CateringAddOnSelection[]
+
+  @@index([packageId, isActive])
+  @@map("catering_add_ons")
+}
+
+/// Extends an Order rather than duplicating it — a catering booking is still
+/// an order with payments, discounts and a status trail, plus event context.
+model CateringOrder {
+  id      String @id @default(uuid()) @db.Uuid
+  orderId String @unique @db.Uuid
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  packageId String?          @db.Uuid
+  package   CateringPackage? @relation(fields: [packageId], references: [id], onDelete: SetNull)
+  userId    String?          @db.Uuid
+  user      User?            @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  stage CateringOrderStage @default(ENQUIRY)
+
+  // -- Event details --------------------------------------------------------
+  eventType    CateringEventType
+  serviceStyle CateringServiceStyle @default(DROP_OFF)
+  eventDate    DateTime             @db.Date
+  /// Local minutes-from-midnight, so a 19:30 start survives DST-free maths.
+  serviceStartMinutes Int
+  serviceEndMinutes   Int?
+  setupByMinutes      Int?
+
+  paxCount     Int
+  /// Snapshot of the band that priced this booking.
+  tierLabel        String?
+  pricePerPaxCents Int
+  /// Snapshot of the package name at booking time.
+  packageNameSnapshot String?
+
+  venueName    String?
+  venueAddress Json
+  venueNotes   String?
+  hasLift      Boolean?
+  parkingNotes String?
+
+  contactName  String
+  contactPhone String
+  contactEmail String?
+  altContactPhone String?
+
+  staffCount   Int @default(0)
+  /// Free-text requirements the sales team captured on the call.
+  specialRequirements String?
+  dietaryNotes        String?
+
+  // -- Money ----------------------------------------------------------------
+  depositDueCents  Int  @default(0)
+  depositPaidAt    DateTime? @db.Timestamptz(3)
+  balanceDueAt     DateTime? @db.Timestamptz(3)
+  quoteExpiresAt   DateTime? @db.Timestamptz(3)
+  menuLockedAt     DateTime? @db.Timestamptz(3)
+
+  assignedManagerId String? @db.Uuid
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  selections      CateringSelection[]
+  addOnSelections CateringAddOnSelection[]
+
+  @@index([eventDate, stage])
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("catering_orders")
+}
+
+/// One dish the guest picked inside one course. Snapshotted like OrderItem.
+model CateringSelection {
+  id              String        @id @default(uuid()) @db.Uuid
+  cateringOrderId String        @db.Uuid
+  cateringOrder   CateringOrder @relation(fields: [cateringOrderId], references: [id], onDelete: Cascade)
+
+  courseOptionId String?               @db.Uuid
+  courseOption   CateringCourseOption? @relation(fields: [courseOptionId], references: [id], onDelete: SetNull)
+
+  courseName  String
+  courseStepIndex Int
+  productName String
+  variantName String?
+  quantity    Int @default(1)
+  /// Zero when the pick was inside includedSelections.
+  surchargePerPaxCents Int @default(0)
+  lineTotalCents       Int @default(0)
+  notes       String?
+
+  @@index([cateringOrderId, courseStepIndex])
+  @@map("catering_selections")
+}
+
+model CateringAddOnSelection {
+  id              String        @id @default(uuid()) @db.Uuid
+  cateringOrderId String        @db.Uuid
+  cateringOrder   CateringOrder @relation(fields: [cateringOrderId], references: [id], onDelete: Cascade)
+  addOnId         String?       @db.Uuid
+  addOn           CateringAddOn? @relation(fields: [addOnId], references: [id], onDelete: SetNull)
+
+  nameSnapshot String
+  quantity     Int @default(1)
+  unitPriceCents Int
+  lineTotalCents Int
+
+  @@index([cateringOrderId])
+  @@map("catering_add_on_selections")
+}
+
+// ============================================================================
+//  TABLE RESERVATIONS
+// ============================================================================
+
+/// "Main Hall", "Terrace", "Private Dining". Guests can request one.
+model ServiceArea {
+  id        String  @id @default(uuid()) @db.Uuid
+  outletId  String  @db.Uuid
+  outlet    Outlet  @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  name      String
+  description String?
+  isBookable Boolean @default(true)
+  isOutdoor  Boolean @default(false)
+  sortOrder  Int     @default(0)
+
+  tables       RestaurantTable[]
+  schedules    ServiceSchedule[]
+  slotInventory SlotInventory[]
+  reservations Reservation[]
+
+  @@unique([outletId, name])
+  @@map("service_areas")
+}
+
+model RestaurantTable {
+  id            String       @id @default(uuid()) @db.Uuid
+  outletId      String       @db.Uuid
+  outlet        Outlet       @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  serviceAreaId String?      @db.Uuid
+  serviceArea   ServiceArea? @relation(fields: [serviceAreaId], references: [id], onDelete: SetNull)
+
+  code     String // "T12"
+  shape    TableShape @default(SQUARE)
+  minPax   Int        @default(1)
+  maxPax   Int
+  /// Floor-plan coordinates for the admin seating view.
+  posX     Int?
+  posY     Int?
+  isJoinable Boolean  @default(true)
+  isActive Boolean    @default(true)
+
+  reservationTables ReservationTable[]
+
+  @@unique([outletId, code])
+  @@index([outletId, isActive])
+  @@map("restaurant_tables")
+}
+
+/// The recurring rule: "Fri–Sun dinner, 17:30–22:00, 30-minute slots,
+/// 90-minute turns, 60 covers per slot". Slots are DERIVED from this.
+model ServiceSchedule {
+  id            String       @id @default(uuid()) @db.Uuid
+  outletId      String       @db.Uuid
+  outlet        Outlet       @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  serviceAreaId String?      @db.Uuid
+  serviceArea   ServiceArea? @relation(fields: [serviceAreaId], references: [id], onDelete: Cascade)
+
+  name             String // "Weekend Dinner"
+  daysOfWeek       Int[]
+  startMinutes     Int
+  endMinutes       Int
+  slotIntervalMinutes Int @default(30)
+  /// How long a table is held; used to compute overlap when seating.
+  turnDurationMinutes Int @default(90)
+
+  /// Covers, not tables. The counter that actually gates a booking.
+  capacityPax      Int
+  maxPartySize     Int  @default(12)
+  minPartySize     Int  @default(1)
+  /// Parties above this route to an enquiry instead of instant confirmation.
+  autoConfirmMaxPax Int @default(8)
+
+  /// Booking window guardrails.
+  minLeadTimeMinutes Int @default(60)
+  maxAdvanceDays     Int @default(60)
+
+  effectiveFrom DateTime? @db.Date
+  effectiveTo   DateTime? @db.Date
+  isActive      Boolean   @default(true)
+
+  @@index([outletId, isActive])
+  @@map("service_schedules")
+}
+
+/// Materialised counter per (outlet, area, date, time). Generated ahead by a
+/// nightly job from ServiceSchedule.
+///
+/// This table exists ONLY to make booking concurrency correct: two guests
+/// booking the last four covers at 19:00 race on THIS ROW. The booking
+/// service does a conditional update
+///   UPDATE slot_inventory SET booked_pax = booked_pax + $1
+///   WHERE id = $2 AND booked_pax + held_pax + $1 <= capacity_pax
+/// and treats zero affected rows as "slot just filled". Computing
+/// availability on the fly from ServiceSchedule cannot express that lock.
+model SlotInventory {
+  id            String       @id @default(uuid()) @db.Uuid
+  outletId      String       @db.Uuid
+  outlet        Outlet       @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  serviceAreaId String?      @db.Uuid
+  serviceArea   ServiceArea? @relation(fields: [serviceAreaId], references: [id], onDelete: Cascade)
+
+  /// Local calendar date at the outlet, plus the exact UTC instant. Both are
+  /// stored: the date drives the picker, the instant drives ordering.
+  serviceDate DateTime @db.Date
+  startsAt    DateTime @db.Timestamptz(3)
+  /// Local minutes-from-midnight, so the UI can label "7:00 PM" without
+  /// re-deriving the timezone.
+  startMinutes Int
+  durationMinutes Int @default(90)
+
+  /// Which channel this counter gates. Reservations and delivery slots use
+  /// the same mechanism with different capacity units.
+  channel FulfilmentChannel @default(DINE_IN)
+
+  capacityPax Int
+  bookedPax   Int @default(0)
+  /// Covers inside an unexpired HELD reservation. Released by a sweeper.
+  heldPax     Int @default(0)
+  /// Order-count capacity for DELIVERY/PICKUP slots (maxOrdersPerSlot).
+  capacityOrders Int?
+  bookedOrders   Int @default(0)
+
+  /// Staff can shut one slot without touching the schedule.
+  isBlocked   Boolean @default(false)
+  blockReason String?
+
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  reservations Reservation[]
+  orders       Order[]
+
+  @@unique([outletId, serviceAreaId, startsAt, channel])
+  @@index([outletId, serviceDate, channel, isBlocked])
+  @@index([startsAt])
+  @@map("slot_inventory")
+}
+
+model Reservation {
+  id                String @id @default(uuid()) @db.Uuid
+  reservationCode   String @unique // "IG-R-8842"
+  outletId          String @db.Uuid
+  outlet            Outlet @relation(fields: [outletId], references: [id])
+  serviceAreaId     String?      @db.Uuid
+  serviceArea       ServiceArea? @relation(fields: [serviceAreaId], references: [id], onDelete: SetNull)
+  slotInventoryId   String       @db.Uuid
+  slotInventory     SlotInventory @relation(fields: [slotInventoryId], references: [id])
+
+  userId String? @db.Uuid
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  guestName  String
+  guestPhone String
+  guestEmail String?
+
+  partySize   Int
+  /// Denormalised from the slot for cheap listing queries.
+  reservedFor DateTime @db.Timestamptz(3)
+  durationMinutes Int  @default(90)
+
+  status ReservationStatus @default(HELD)
+  /// A HELD row past this instant is swept back into the slot's heldPax.
+  holdExpiresAt DateTime? @db.Timestamptz(3)
+
+  occasion      String? // birthday, anniversary
+  specialRequests String?
+  highChairCount Int @default(0)
+  wheelchairAccess Boolean @default(false)
+
+  /// Deposit-backed bookings for large parties or peak nights.
+  depositOrderId String? @unique @db.Uuid
+  depositOrder   Order?  @relation(fields: [depositOrderId], references: [id], onDelete: SetNull)
+
+  confirmedAt DateTime? @db.Timestamptz(3)
+  seatedAt    DateTime? @db.Timestamptz(3)
+  completedAt DateTime? @db.Timestamptz(3)
+  cancelledAt DateTime? @db.Timestamptz(3)
+  cancellationReason String?
+  noShowMarkedAt DateTime? @db.Timestamptz(3)
+
+  /// Client-supplied; stops a double-tap on "Confirm" creating two bookings.
+  idempotencyKey String? @unique
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  tables ReservationTable[]
+
+  @@index([outletId, reservedFor, status])
+  @@index([userId, reservedFor(sort: Desc)])
+  @@index([status, holdExpiresAt])
+  @@map("reservations")
+}
+
+/// A party of 10 occupies two joined tables; hence a join table rather than a
+/// tableId column on Reservation.
+model ReservationTable {
+  reservationId String          @db.Uuid
+  reservation   Reservation     @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+  tableId       String          @db.Uuid
+  table         RestaurantTable @relation(fields: [tableId], references: [id], onDelete: Cascade)
+  assignedAt    DateTime        @default(now()) @db.Timestamptz(3)
+
+  @@id([reservationId, tableId])
+  @@index([tableId])
+  @@map("reservation_tables")
+}
+
+// ============================================================================
+//  GATE POINTS — loyalty, coupons, referrals
+// ============================================================================
+
+model LoyaltyTier {
+  id       String          @id @default(uuid()) @db.Uuid
+  code     LoyaltyTierCode @unique
+  name     String
+  /// Points earned in the rolling window needed to reach this tier.
+  thresholdPoints Int
+  /// Earn multiplier in basis points. 12500 = 1.25×.
+  earnMultiplierBps Int @default(10000)
+  benefits Json?
+  colorHex String?
+  iconUrl  String?
+  sortOrder Int @default(0)
+
+  accounts LoyaltyAccount[]
+
+  @@map("loyalty_tiers")
+}
+
+/// balancePoints and lifetimePoints are CACHES of the ledger. A nightly job
+/// re-derives them and alerts on drift; the ledger always wins.
+model LoyaltyAccount {
+  id     String @id @default(uuid()) @db.Uuid
+  userId String @unique @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  balancePoints  Int @default(0)
+  lifetimePoints Int @default(0)
+  /// Points earned in the current tier window, reset on anniversary.
+  windowPoints   Int @default(0)
+  windowStartedAt DateTime @default(now()) @db.Timestamptz(3)
+
+  tierId String?      @db.Uuid
+  tier   LoyaltyTier? @relation(fields: [tierId], references: [id], onDelete: SetNull)
+  tierAchievedAt DateTime? @db.Timestamptz(3)
+  /// Set when a downgrade is due; grace period before it applies.
+  tierExpiresAt  DateTime? @db.Timestamptz(3)
+
+  /// Optimistic-concurrency guard for point spends.
+  version Int @default(0)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  entries LoyaltyLedgerEntry[]
+
+  @@index([tierId])
+  @@map("loyalty_accounts")
+}
+
+/// Append-only. Never updated except to stamp consumedAt / voidedAt.
+model LoyaltyLedgerEntry {
+  id        String         @id @default(uuid()) @db.Uuid
+  accountId String         @db.Uuid
+  account   LoyaltyAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  type LoyaltyEntryType
+  /// Signed. EARN_* positive, REDEEM_*/EXPIRE/REVERSAL negative.
+  points Int
+  /// Cash value applied when this entry was a redemption, for the P&L.
+  cashValueCents Int?
+
+  orderId String? @db.Uuid
+  order   Order?  @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+  description String
+  metadata    Json?
+
+  /// FIFO expiry: earn entries carry an expiry, redemptions consume the
+  /// oldest unexpired lots first.
+  expiresAt   DateTime? @db.Timestamptz(3)
+  /// How much of a positive lot has been spent.
+  consumedPoints Int @default(0)
+  voidedAt    DateTime? @db.Timestamptz(3)
+
+  /// Guards against a webhook awarding points twice for one order.
+  idempotencyKey String? @unique
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([accountId, createdAt(sort: Desc)])
+  @@index([accountId, expiresAt, consumedPoints])
+  @@index([orderId])
+  @@map("loyalty_ledger_entries")
+}
+
+/// Catalogue of things points buy — free masala dosa, $5 off, free delivery.
+model LoyaltyReward {
+  id          String  @id @default(uuid()) @db.Uuid
+  name        String
+  description String?
+  imageUrl    String?
+  pointsCost  Int
+  /// Either a coupon minted on redemption, or a direct cart discount.
+  couponTemplateId String? @db.Uuid
+  discountCents    Int?
+  minTierCode LoyaltyTierCode?
+  stockRemaining Int?
+  isActive    Boolean @default(true)
+  sortOrder   Int     @default(0)
+  startsAt    DateTime? @db.Timestamptz(3)
+  endsAt      DateTime? @db.Timestamptz(3)
+
+  @@index([isActive, sortOrder])
+  @@map("loyalty_rewards")
+}
+
+model Coupon {
+  id   String @id @default(uuid()) @db.Uuid
+  code String @unique @db.Citext
+  name String
+  description String?
+
+  type  CouponType
+  scope CouponScope @default(CART)
+
+  /// Percentage coupons use valueBps (1500 = 15%); fixed use valueCents.
+  valueBps   Int?
+  valueCents Int?
+  maxDiscountCents Int?
+
+  minOrderCents Int @default(0)
+  /// Restrictions. Empty array = no restriction.
+  eligibleChannels   FulfilmentChannel[]
+  eligibleOutletIds  String[]           @db.Uuid
+  eligibleCategoryIds String[]          @db.Uuid
+  eligibleProductIds String[]           @db.Uuid
+  minTierCode        LoyaltyTierCode?
+  firstOrderOnly     Boolean @default(false)
+
+  /// Global and per-user caps, both enforced inside the redemption
+  /// transaction against CouponRedemption.
+  maxRedemptions        Int?
+  maxRedemptionsPerUser Int  @default(1)
+  redemptionCount       Int  @default(0)
+
+  /// Can this stack with automatic promotions and points redemption?
+  isStackable Boolean @default(false)
+  /// Ranked when several apply and stacking is off; higher wins.
+  priority    Int     @default(0)
+
+  startsAt DateTime  @db.Timestamptz(3)
+  endsAt   DateTime? @db.Timestamptz(3)
+  isActive Boolean   @default(true)
+
+  /// Single-use personal codes minted from a reward redemption.
+  issuedToUserId String? @db.Uuid
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  redemptions    CouponRedemption[]
+  orderDiscounts OrderDiscount[]
+
+  @@index([isActive, startsAt, endsAt])
+  @@index([issuedToUserId])
+  @@map("coupons")
+}
+
+model CouponRedemption {
+  id       String @id @default(uuid()) @db.Uuid
+  couponId String @db.Uuid
+  coupon   Coupon @relation(fields: [couponId], references: [id], onDelete: Cascade)
+  userId   String? @db.Uuid
+  user     User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+  orderId  String  @db.Uuid
+  order    Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  discountCents Int
+  redeemedAt    DateTime @default(now()) @db.Timestamptz(3)
+  /// Set when the order is cancelled — the redemption is released back.
+  revokedAt     DateTime? @db.Timestamptz(3)
+
+  /// One redemption per coupon per order, enforced in the database rather
+  /// than trusting the checkout service.
+  @@unique([couponId, orderId])
+  @@index([couponId, userId, revokedAt])
+  @@map("coupon_redemptions")
+}
+
+model Referral {
+  id         String @id @default(uuid()) @db.Uuid
+  referrerId String @db.Uuid
+  referrer   User   @relation("referrer", fields: [referrerId], references: [id], onDelete: Cascade)
+  refereeId  String? @unique @db.Uuid
+  referee    User?  @relation("referee", fields: [refereeId], references: [id], onDelete: SetNull)
+
+  code String @unique @db.Citext
+  /// Points paid out only after the referee's first order completes, so a
+  /// cancelled order does not mint free points.
+  qualifyingOrderId String? @db.Uuid
+  referrerPoints    Int     @default(0)
+  refereePoints     Int     @default(0)
+  rewardedAt        DateTime? @db.Timestamptz(3)
+  createdAt         DateTime  @default(now()) @db.Timestamptz(3)
+
+  @@index([referrerId])
+  @@map("referrals")
+}
+
+// ============================================================================
+//  ENGAGEMENT & PLATFORM PLUMBING
+// ============================================================================
+
+model Review {
+  id        String  @id @default(uuid()) @db.Uuid
+  userId    String  @db.Uuid
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  orderId   String? @unique @db.Uuid
+  order     Order?  @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  productId String? @db.Uuid
+  product   Product? @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  rating       Int // 1..5, enforced by a CHECK constraint in a migration
+  foodRating   Int?
+  deliveryRating Int?
+  comment      String?
+  imageUrls    String[]
+
+  isPublished  Boolean @default(false)
+  moderatedAt  DateTime? @db.Timestamptz(3)
+  staffReply   String?
+  staffRepliedAt DateTime? @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([productId, isPublished, createdAt(sort: Desc)])
+  @@index([userId])
+  @@map("reviews")
+}
+
+model NotificationLog {
+  id      String              @id @default(uuid()) @db.Uuid
+  userId  String?             @db.Uuid
+  user    User?               @relation(fields: [userId], references: [id], onDelete: SetNull)
+  channel NotificationChannel
+  template String
+  /// Rendered payload, kept for support ("what did we actually send them?").
+  payload Json
+  targetAddress String? // phone, email or push token at send time
+  providerMessageId String?
+  status  String  @default("QUEUED") // QUEUED | SENT | DELIVERED | FAILED
+  error   String?
+  sentAt  DateTime? @db.Timestamptz(3)
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([status, createdAt])
+  @@map("notification_logs")
+}
+
+/// Transactional outbox. Domain writes and the event that announces them
+/// commit in ONE transaction; a relay publishes to the message bus after.
+/// Without this, "order paid" can be persisted while the push notification
+/// and the KDS broadcast are lost, or vice versa.
+model OutboxEvent {
+  id            String       @id @default(uuid()) @db.Uuid
+  aggregateType String // Order | Reservation | CateringOrder | LoyaltyAccount
+  aggregateId   String       @db.Uuid
+  eventType     String // order.status_changed | reservation.confirmed
+  payload       Json
+  status        OutboxStatus @default(PENDING)
+  attempts      Int          @default(0)
+  lastError     String?
+  availableAt   DateTime     @default(now()) @db.Timestamptz(3)
+  publishedAt   DateTime?    @db.Timestamptz(3)
+  createdAt     DateTime     @default(now()) @db.Timestamptz(3)
+
+  @@index([status, availableAt])
+  @@index([aggregateType, aggregateId])
+  @@map("outbox_events")
+}
+
+/// Request-level idempotency for every non-GET mutation. Stores the response
+/// so a retry returns the original body instead of re-executing.
+model IdempotencyRecord {
+  key          String   @id
+  userId       String?  @db.Uuid
+  endpoint     String
+  requestHash  String
+  responseCode Int?
+  responseBody Json?
+  lockedAt     DateTime @default(now()) @db.Timestamptz(3)
+  completedAt  DateTime? @db.Timestamptz(3)
+  expiresAt    DateTime @db.Timestamptz(3)
+
+  @@index([expiresAt])
+  @@map("idempotency_records")
+}
+
+/// Anything a regulator or an angry customer might ask about.
+model AuditLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  actorId    String?  @db.Uuid
+  actorType  String   @default("USER")
+  action     String // order.refunded | product.price_changed
+  entityType String
+  entityId   String
+  before     Json?
+  after      Json?
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([entityType, entityId, createdAt(sort: Desc)])
+  @@index([actorId, createdAt(sort: Desc)])
+  @@map("audit_logs")
+}
+
+/// Server-driven feature gating. Mobile release cycles are slow; this is how
+/// a broken catering wizard gets turned off without an App Store review.
+model FeatureFlag {
+  key         String   @id
+  description String?
+  isEnabled   Boolean  @default(false)
+  /// 0..100 rollout, hashed on user id.
+  rolloutPercent Int   @default(0)
+  /// Minimum app build allowed to see it.
+  minAppVersion  String?
+  targetOutletIds String[] @db.Uuid
+  payload     Json?
+  updatedAt   DateTime @updatedAt @db.Timestamptz(3)
+
+  @@map("feature_flags")
+}

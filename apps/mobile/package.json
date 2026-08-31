@@ -1,0 +1,41 @@
+{
+  "name": "@indiagate/mobile",
+  "version": "0.0.0",
+  "private": true,
+  "main": "expo-router/entry",
+  "scripts": {
+    "dev": "expo start",
+    "build": "expo export",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint . --max-warnings 0",
+    "test": "vitest run",
+    "build:ios": "eas build --platform ios --profile production",
+    "build:android": "eas build --platform android --profile production",
+    "update": "eas update --branch production"
+  },
+  "dependencies": {
+    "@indiagate/contracts": "workspace:*",
+    "@indiagate/core": "workspace:*",
+    "@indiagate/queries": "workspace:*",
+    "@indiagate/ui": "workspace:*",
+    "@tanstack/react-query": "^5.59.0",
+    "expo": "~51.0.39",
+    "expo-router": "~3.5.24",
+    "expo-secure-store": "~13.0.2",
+    "expo-notifications": "~0.28.19",
+    "expo-updates": "~0.25.27",
+    "react": "18.3.1",
+    "react-native": "0.74.5",
+    "react-native-maps": "1.14.0",
+    "react-native-reanimated": "~3.10.1",
+    "react-hook-form": "^7.53.0",
+    "@hookform/resolvers": "^3.9.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@indiagate/tsconfig": "workspace:*",
+    "@indiagate/eslint-config": "workspace:*",
+    "@types/react": "^18.3.11",
+    "vitest": "^2.1.2"
+  }
+}

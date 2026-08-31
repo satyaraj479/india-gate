@@ -1,0 +1,28 @@
+{
+  "name": "@indiagate/contracts",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./client": "./src/client.ts",
+    "./schemas": "./src/schemas/index.ts",
+    "./openapi.yaml": "./openapi.yaml"
+  },
+  "scripts": {
+    "codegen": "openapi-typescript ./openapi.yaml -o ./src/generated/api.ts && prettier --write ./src/generated/api.ts",
+    "lint:spec": "redocly lint ./openapi.yaml",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "openapi-fetch": "^0.13.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@indiagate/tsconfig": "workspace:*",
+    "@redocly/cli": "^1.25.0",
+    "openapi-typescript": "^7.4.1",
+    "vitest": "^2.1.2"
+  }
+}

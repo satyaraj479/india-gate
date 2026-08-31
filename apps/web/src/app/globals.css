@@ -1,0 +1,161 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /**
+   * The app is dark-only by design. Rather than shipping a light palette that
+   * nobody will ever see, the tokens are defined once on `:root` and the
+   * `.dark` class is aliased to the same values so any shadcn component that
+   * assumes a dark scope still resolves.
+   */
+  :root {
+    --navy-950: 226 60% 6%;
+    --navy-900: 226 60% 10%; /* #0A1128 — the brand background */
+    --navy-800: 226 51% 15%;
+    --navy-700: 226 45% 20%;
+    --navy-600: 226 38% 28%;
+
+    --gold-400: 46 71% 64%;
+    --gold-500: 46 65% 52%; /* #D4AF37 — the brand accent */
+    --gold-600: 46 62% 44%;
+
+    --background: var(--navy-900);
+    --foreground: 0 0% 100%;
+
+    --card: var(--navy-800);
+    --card-foreground: 0 0% 100%;
+
+    --popover: 226 55% 12%;
+    --popover-foreground: 0 0% 100%;
+
+    --primary: var(--gold-500);
+    /* Gold is a light accent; text on it must be the dark navy, not white.
+       Contrast on #D4AF37 with #0A1128 is 8.1:1 — comfortably AAA for body. */
+    --primary-foreground: 226 60% 10%;
+
+    --secondary: var(--navy-700);
+    --secondary-foreground: 0 0% 100%;
+
+    --muted: var(--navy-800);
+    /* 66% lightness against the navy-900 ground gives 6.4:1 — above the 4.5:1
+       floor, so secondary copy stays legible rather than merely decorative. */
+    --muted-foreground: 220 20% 72%;
+
+    --accent: var(--navy-700);
+    --accent-foreground: 0 0% 100%;
+
+    --destructive: 0 72% 55%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 226 40% 22%;
+    --input: 226 42% 18%;
+    --ring: var(--gold-500);
+
+    --veg: 142 62% 45%;
+    --nonveg: 0 72% 55%;
+
+    --radius: 0.75rem;
+
+    /*
+      Typography. Two stacks rather than a downloaded webfont: the build stays
+      hermetic, there is no third-party request, and there is no font-swap
+      shift. Each stack names the "ideal" face first, so a machine that has
+      Cormorant Garamond installed gets it, and every other machine lands on a
+      transitional serif with similar proportions instead of Times.
+
+      To adopt a real webfont, set these two variables from a `next/font`
+      loader in `layout.tsx`; nothing else in the design references a font
+      family directly.
+    */
+    --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system,
+      "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --font-display: "Cormorant Garamond", ui-serif, "Iowan Old Style",
+      "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+  }
+
+  .dark {
+    color-scheme: dark;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    scroll-behavior: smooth;
+    /* The sticky header plus the category rail are 8.5rem tall; without this
+       a jump link lands with the section title hidden underneath them. */
+    scroll-padding-top: 8.5rem;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    background-image:
+      radial-gradient(
+        60rem 40rem at 82% -8%,
+        hsl(var(--gold-500) / 0.07),
+        transparent 60%
+      ),
+      radial-gradient(
+        50rem 34rem at -6% 4%,
+        hsl(var(--navy-600) / 0.45),
+        transparent 62%
+      );
+      background-attachment: fixed;
+  }
+
+  ::selection {
+    background: hsl(var(--gold-500) / 0.3);
+  }
+
+  /* Focus rings are gold and always visible on keyboard navigation. The
+     default shadcn ring is near-invisible on this ground. */
+  :focus-visible {
+    @apply outline-none ring-2 ring-gold/70 ring-offset-2 ring-offset-navy-900;
+  }
+}
+
+@layer components {
+  .heading-serif {
+    @apply font-display tracking-tight;
+  }
+
+  /* The hairline + inner glow used on every elevated surface. Repeated on
+     ~15 components, so it earns a class rather than a copied utility string. */
+  .surface {
+    @apply rounded-lg border border-white/[0.07] bg-navy-800/70 backdrop-blur-sm;
+    box-shadow: inset 0 1px 0 hsl(0 0% 100% / 0.04);
+  }
+
+  .gold-rule {
+    @apply h-px w-full bg-gradient-to-r from-transparent via-gold/45 to-transparent;
+  }
+
+  .text-gradient-gold {
+    @apply bg-gold-sheen bg-clip-text text-transparent;
+  }
+
+  /* Horizontal scrollers (category rail, chip rows) keep their scroll
+     mechanics but drop the bar, which reads as chrome on a dark surface. */
+  .no-scrollbar {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+}

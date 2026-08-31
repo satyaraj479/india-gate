@@ -1,0 +1,15 @@
+# pnpm, not npm/yarn. Two reasons that matter here:
+#
+#  1. Strict node_modules. Expo's Metro bundler will happily resolve a
+#     transitive dependency that a package never declared, and it works on
+#     the dev's machine and dies in the EAS build. pnpm's non-flat layout
+#     makes that mistake fail immediately, locally.
+#  2. `workspace:*` protocol gives an unambiguous internal-vs-external
+#     distinction, which the publish/deploy pruning depends on.
+#
+# Metro needs `node-linker=hoisted` in .npmrc to cope with symlinks; see the
+# note there.
+packages:
+  - "apps/*"
+  - "packages/*"
+  - "packages/config/*"

@@ -1,0 +1,13 @@
+{
+  "name": "@indiagate/ui",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./tokens": "./src/tokens.ts",
+    "./formatters": "./src/formatters.ts"
+  },
+  "scripts": { "typecheck": "tsc --noEmit" },
+  "dependencies": { "@indiagate/core": "workspace:*" },
+  "devDependencies": { "@indiagate/tsconfig": "workspace:*" }
+}
