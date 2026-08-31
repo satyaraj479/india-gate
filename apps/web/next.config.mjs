@@ -21,9 +21,11 @@ const nextConfig = {
     outputFileTracingRoot: new URL("../../", import.meta.url).pathname,
   },
 
-  // Standalone output so the container ships only what is traced, not the
-  // whole pnpm store.
-  output: "standalone",
+  // Standalone output so a Docker image ships only what is traced rather than
+  // the whole pnpm store. Vercel does its own tracing and treats `standalone`
+  // as redundant, so it is switched off there — leaving it on has been a
+  // source of odd, hard-to-read build failures on that platform.
+  output: process.env.VERCEL ? undefined : "standalone",
 
   images: {
     remotePatterns: [

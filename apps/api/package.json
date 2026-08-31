@@ -1,15 +1,10 @@
 {
   "name": "@indiagate/api",
+  "//": "apps/api is a scaffold: the architecture, Prisma schema and OpenAPI contract are complete but the NestJS source is not. The build/typecheck/lint/test scripts are deliberately absent so `turbo run build` at the repo root does not fail on an app that has nothing to build. Restore them from docs/ARCHITECTURE.md section 13 when you start on it.",
   "version": "0.0.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "nest start --watch",
-    "build": "nest build",
-    "start": "node dist/main.js",
-    "typecheck": "tsc --noEmit",
-    "test": "vitest run",
-    "test:e2e": "vitest run --config vitest.e2e.config.ts",
     "spec:emit": "tsx scripts/emit-openapi.ts"
   },
   "dependencies": {

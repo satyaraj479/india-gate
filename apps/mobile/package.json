@@ -1,14 +1,10 @@
 {
   "name": "@indiagate/mobile",
+  "//": "apps/mobile is a scaffold: metro.config.js and the dependency set are in place, the Expo app itself is not. Task scripts are deliberately absent so the root `turbo run build` does not fail on an app with no source.",
   "version": "0.0.0",
   "private": true,
   "main": "expo-router/entry",
   "scripts": {
-    "dev": "expo start",
-    "build": "expo export",
-    "typecheck": "tsc --noEmit",
-    "lint": "eslint . --max-warnings 0",
-    "test": "vitest run",
     "build:ios": "eas build --platform ios --profile production",
     "build:android": "eas build --platform android --profile production",
     "update": "eas update --branch production"

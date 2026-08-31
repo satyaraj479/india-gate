@@ -52,14 +52,12 @@ completes end to end.
    in a module-level Map. The confirmation page falls back to a signed cookie
    so a serverless deploy still renders a receipt, but a restart loses
    everything. Replace `InMemoryOrderStore` before this takes a real order.
-2. **Not deployed.** A Vercel attempt failed because Vercel ran
-   `turbo run build` from the repo root and tried to build the two scaffold
-   apps. Two fixes, neither applied:
-   - Set **Root Directory = `apps/web`** in the Vercel project, with
-     "include files outside root directory" on (needed for `@indiagate/core`).
-   - Remove the unrunnable `build` / `test` scripts from `apps/api` and
-     `apps/mobile`, and switch off `output: "standalone"` when
-     `process.env.VERCEL` is set.
+2. **Not deployed yet, but the build is fixed.** An earlier Vercel attempt
+   failed because Vercel ran `turbo run build` from the repo root and tried to
+   build the two scaffold apps. Their unrunnable `build`/`test` scripts have
+   been removed, so `turbo run build` now builds only `@indiagate/web`. When
+   you import this repo into Vercel, set **Root Directory = `apps/web`** —
+   without it Vercel cannot find the Next.js output.
 3. **No authentication.** Guest checkout only.
 4. **Reservation availability is generated**, not read from a real floor plan.
    The two-phase hold that makes booking safe under concurrency is specified
