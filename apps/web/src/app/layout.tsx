@@ -6,6 +6,7 @@ import { SiteFooter } from "@/components/layout/site-footer";
 import { CartDrawer } from "@/components/cart/cart-drawer";
 import { ServiceabilityModal } from "@/components/layout/serviceability-modal";
 import { OUTLET } from "@/lib/config";
+import { getSiteUrl } from "@/lib/site-url";
 
 import "./globals.css";
 
@@ -23,9 +24,7 @@ import "./globals.css";
  */
 
 export const metadata: Metadata = {
-  metadataBase: new URL(
-    process.env.NEXT_PUBLIC_SITE_URL ?? "https://indiagate.sg",
-  ),
+  metadataBase: new URL(getSiteUrl()),
   title: {
     default: "India Gate — South Indian Kitchen, Little India Singapore",
     template: "%s · India Gate",

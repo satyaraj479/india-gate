@@ -5,6 +5,7 @@ import { repriceOrder } from "@/lib/checkout/reprice";
 import { getOrderStore } from "@/lib/orders/store";
 import { setReceiptCookie } from "@/lib/orders/receipt";
 import { getPaymentProvider, PaymentConfigurationError } from "@/lib/payments";
+import { getSiteUrl } from "@/lib/site-url";
 import {
   customerContactSchema,
   deliveryAddressSchema,
@@ -162,9 +163,12 @@ export async function POST(request: Request) {
         email: body.contact.email,
         phone: body.contact.phone,
       },
+      // Same empty-string trap as metadataBase — see lib/site-url.ts. Here it
+      // would be worse than a failed build: the gateway would be handed a
+      // malformed return URL and the guest would be stranded after paying.
       returnUrl: new URL(
         `/checkout/confirmation/${order.orderNumber}`,
-        process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000",
+        getSiteUrl(),
       ).toString(),
       // The order id is stable for this order and only ever used once, which
       // is exactly what a gateway idempotency key needs to be.
